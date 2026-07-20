@@ -81,6 +81,7 @@ struct SwingImportView: View {
                     }
 
                 metadataContent
+                poseTrackAnalysisContent
                 frameExtractionControls
                 extractedFrameContent
             }
@@ -201,7 +202,7 @@ struct SwingImportView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Extracted Frame")
                     .font(.headline)
-                extractedFrameImage(frame)
+                poseFrameImage(frame, pose: singleFramePose)
                 Text("Requested \(formatSeconds(frame.requestedTimestampSeconds))s, received \(formatSeconds(frame.actualTimestampSeconds))s")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -214,14 +215,14 @@ struct SwingImportView: View {
         }
     }
 
-    private func extractedFrameImage(_ frame: SwingExtractedFrame) -> some View {
+    private func poseFrameImage(_ frame: SwingExtractedFrame, pose: DetectedPose?) -> some View {
         let imageSize = CGSize(width: frame.image.width, height: frame.image.height)
 
         return Image(decorative: frame.image, scale: 1)
             .resizable()
             .scaledToFit()
             .overlay {
-                if viewModel.isPoseOverlayVisible, case .detected(let pose) = viewModel.poseAnalysisState {
+                if viewModel.isPoseOverlayVisible, let pose {
                     PoseSkeletonOverlay(pose: pose, imageSize: imageSize)
                 }
             }
@@ -230,6 +231,197 @@ struct SwingImportView: View {
                 RoundedRectangle(cornerRadius: 16)
                     .stroke(.quaternary, lineWidth: 1)
             }
+    }
+
+    private var singleFramePose: DetectedPose? {
+        if case .detected(let pose) = viewModel.poseAnalysisState {
+            return pose
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private var poseTrackAnalysisContent: some View {
+        if case .available(let metadata) = viewModel.metadataState {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Sequence Pose Analysis")
+                    .font(.headline)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Start")
+                        Spacer()
+                        Text(formatSeconds(viewModel.intervalStartSeconds))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: Binding(
+                        get: { viewModel.intervalStartSeconds },
+                        set: { viewModel.setIntervalStart($0) }
+                    ), in: 0...metadata.durationSeconds)
+
+                    HStack {
+                        Text("End")
+                        Spacer()
+                        Text(formatSeconds(viewModel.intervalEndSeconds))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: Binding(
+                        get: { viewModel.intervalEndSeconds },
+                        set: { viewModel.setIntervalEnd($0) }
+                    ), in: 0...metadata.durationSeconds)
+
+                    HStack {
+                        Text("Sampling Rate")
+                        Spacer()
+                        Text("\(formatRate(viewModel.sequenceSamplesPerSecond)) / sec")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: Binding(
+                        get: { viewModel.sequenceSamplesPerSecond },
+                        set: { viewModel.setSequenceSamplesPerSecond($0) }
+                    ), in: 1...30, step: 1)
+                }
+
+                if let message = viewModel.sequenceValidationMessage {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if metadata.isHighFrameRateSource {
+                    Text("Timing uses the imported presentation timeline; Slo-mo capture timing is not recovered yet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Button {
+                        viewModel.startPoseTrackAnalysis()
+                    } label: {
+                        Label("Analyze Interval", systemImage: "figure.walk.motion")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isAnalyzingPoseTrack)
+
+                    if isAnalyzingPoseTrack {
+                        Button("Cancel") {
+                            viewModel.cancelPoseTrackAnalysis()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                poseTrackStatus
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        }
+    }
+
+    @ViewBuilder
+    private var poseTrackStatus: some View {
+        switch viewModel.poseTrackAnalysisState {
+        case .idle:
+            EmptyView()
+
+        case .analyzing(let progress):
+            VStack(alignment: .leading, spacing: 8) {
+                ProgressView(value: progress.fractionCompleted)
+                Text("Processed \(progress.processedSamples) of \(progress.totalSamples) samples")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .completed(let track):
+            poseTrackSummary(track)
+            poseTrackSampleSelector(track)
+
+        case .cancelled:
+            Label("Sequence analysis cancelled.", systemImage: "stop.circle")
+                .foregroundStyle(.secondary)
+
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private func poseTrackSummary(_ track: SwingPoseTrack) -> some View {
+        let summary = track.summary
+
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Track Summary")
+                .font(.headline)
+            Text("Total samples: \(summary.totalSamples)")
+            Text("With pose: \(summary.samplesWithPose), without pose: \(summary.samplesWithoutPose)")
+            Text("Complete: \(summary.completeSamples), partial: \(summary.partialSamples), torso insufficient: \(summary.torsoInsufficientSamples)")
+            Text("Average accepted joints: \(formatDecimal(summary.averageAcceptedJointCount))")
+            Text("Processing: \(formatSeconds(summary.processingDurationSeconds))s total, \(formatSeconds(summary.averageProcessingTimePerSample))s/sample")
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+    }
+
+    private func poseTrackSampleSelector(_ track: SwingPoseTrack) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !track.samples.isEmpty {
+                Picker("Sample", selection: Binding(
+                    get: { viewModel.selectedPoseSampleID ?? track.samples[0].id },
+                    set: { sampleID in
+                        if let sample = track.samples.first(where: { $0.id == sampleID }) {
+                            Task { await viewModel.selectPoseSample(sample) }
+                        }
+                    }
+                )) {
+                    ForEach(track.samples) { sample in
+                        Text("\(formatSeconds(sample.actualTime))s - \(sample.quality.category.rawValue)")
+                            .tag(sample.id)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                selectedPoseSampleContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var selectedPoseSampleContent: some View {
+        switch viewModel.selectedPoseSampleFrameState {
+        case .idle:
+            Text("Select a sample to review its frame and skeleton.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+        case .loading:
+            HStack(spacing: 12) {
+                ProgressView()
+                Text("Loading sample frame...")
+                    .foregroundStyle(.secondary)
+            }
+
+        case .loaded(let sample, let frame):
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Sample at \(formatSeconds(sample.actualTime))s")
+                    .font(.headline)
+                Text("Quality: \(sample.quality.category.rawValue)")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Text("Missing: \(formatJoints(sample.quality.missingJoints))")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                poseFrameImage(frame, pose: sample.pose)
+            }
+
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
     }
 
     @ViewBuilder
@@ -310,6 +502,13 @@ struct SwingImportView: View {
         return false
     }
 
+    private var isAnalyzingPoseTrack: Bool {
+        if case .analyzing = viewModel.poseTrackAnalysisState {
+            return true
+        }
+        return false
+    }
+
     private var hasPoseOverlay: Bool {
         if case .detected = viewModel.poseAnalysisState {
             return true
@@ -327,6 +526,18 @@ struct SwingImportView: View {
 
     private func formatConfidence(_ confidence: Double) -> String {
         confidence.formatted(.number.precision(.fractionLength(2)))
+    }
+
+    private func formatRate(_ rate: Double) -> String {
+        rate.formatted(.number.precision(.fractionLength(0)))
+    }
+
+    private func formatDecimal(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(1)))
+    }
+
+    private func formatJoints(_ joints: [BodyJoint]) -> String {
+        joints.isEmpty ? "None" : joints.map(\.displayName).joined(separator: ", ")
     }
 }
 

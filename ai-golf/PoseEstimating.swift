@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 import Vision
 
-protocol PoseEstimating {
+protocol PoseEstimating: Sendable {
     func detectPose(in image: CGImage, minimumConfidence: Double) async throws -> DetectedPose?
 }
 

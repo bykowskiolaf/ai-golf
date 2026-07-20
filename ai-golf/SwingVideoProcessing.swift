@@ -2,7 +2,7 @@ import AVFoundation
 import CoreGraphics
 import Foundation
 
-protocol SwingVideoProcessing {
+protocol SwingVideoProcessing: Sendable {
     func inspectVideo(at url: URL) async throws -> SwingVideoMetadata
     func extractFrame(at timestampSeconds: Double, from url: URL) async throws -> SwingExtractedFrame
 }

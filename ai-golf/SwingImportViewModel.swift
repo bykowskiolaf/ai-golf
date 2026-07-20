@@ -34,13 +34,31 @@ final class SwingImportViewModel {
         case failed(message: String)
     }
 
+    enum PoseTrackAnalysisState: Equatable {
+        case idle
+        case analyzing(PoseTrackProgress)
+        case completed(SwingPoseTrack)
+        case cancelled
+        case failed(message: String)
+    }
+
+    enum SelectedPoseSampleFrameState {
+        case idle
+        case loading
+        case loaded(sample: PoseSample, frame: SwingExtractedFrame)
+        case failed(message: String)
+    }
+
     private let fileManager: FileManager
     private let importDirectory: URL
     private let videoProcessor: SwingVideoProcessing
     private let poseEstimator: PoseEstimating
+    private let poseTrackAnalyzer: SwingPoseTrackAnalyzing
     private var currentImportedFile: URL?
     private var activeVideoID = UUID()
     private var activeFrameID = UUID()
+    private var activeTrackID = UUID()
+    private var poseTrackTask: Task<Void, Never>?
 
     private(set) var state: State = .empty
     private(set) var metadataState: MetadataState = .idle
@@ -49,16 +67,26 @@ final class SwingImportViewModel {
     private(set) var poseAnalysisState: PoseAnalysisState = .noExtractedFrame
     var minimumPoseConfidence = 0.3
     var isPoseOverlayVisible = true
+    var intervalStartSeconds = 0.0
+    var intervalEndSeconds = 0.0
+    var sequenceSamplesPerSecond = 10.0
+    private(set) var sequenceValidationMessage: String?
+    private(set) var poseTrackAnalysisState: PoseTrackAnalysisState = .idle
+    private(set) var selectedPoseSampleID: UUID?
+    private(set) var selectedPoseSampleFrameState: SelectedPoseSampleFrameState = .idle
 
     init(
         importDirectory: URL = FileManager.default.temporaryDirectory
             .appending(path: "ImportedSwings", directoryHint: .isDirectory),
         fileManager: FileManager = .default
     ) {
+        let videoProcessor = AVFoundationSwingVideoProcessor()
+        let poseEstimator = VisionPoseEstimator()
         self.importDirectory = importDirectory
         self.fileManager = fileManager
-        self.videoProcessor = AVFoundationSwingVideoProcessor()
-        self.poseEstimator = VisionPoseEstimator()
+        self.videoProcessor = videoProcessor
+        self.poseEstimator = poseEstimator
+        self.poseTrackAnalyzer = SwingPoseTrackAnalyzer(videoProcessor: videoProcessor, poseEstimator: poseEstimator)
     }
 
     init(
@@ -66,10 +94,12 @@ final class SwingImportViewModel {
         fileManager: FileManager = .default,
         videoProcessor: SwingVideoProcessing
     ) {
+        let poseEstimator = VisionPoseEstimator()
         self.importDirectory = importDirectory
         self.fileManager = fileManager
         self.videoProcessor = videoProcessor
-        self.poseEstimator = VisionPoseEstimator()
+        self.poseEstimator = poseEstimator
+        self.poseTrackAnalyzer = SwingPoseTrackAnalyzer(videoProcessor: videoProcessor, poseEstimator: poseEstimator)
     }
 
     init(
@@ -82,6 +112,21 @@ final class SwingImportViewModel {
         self.fileManager = fileManager
         self.videoProcessor = videoProcessor
         self.poseEstimator = poseEstimator
+        self.poseTrackAnalyzer = SwingPoseTrackAnalyzer(videoProcessor: videoProcessor, poseEstimator: poseEstimator)
+    }
+
+    init(
+        importDirectory: URL,
+        fileManager: FileManager = .default,
+        videoProcessor: SwingVideoProcessing,
+        poseEstimator: PoseEstimating,
+        poseTrackAnalyzer: SwingPoseTrackAnalyzing
+    ) {
+        self.importDirectory = importDirectory
+        self.fileManager = fileManager
+        self.videoProcessor = videoProcessor
+        self.poseEstimator = poseEstimator
+        self.poseTrackAnalyzer = poseTrackAnalyzer
     }
 
     func importVideo(loadSourceURL: () async throws -> URL) async {
@@ -170,6 +215,9 @@ final class SwingImportViewModel {
             guard activeVideoID == videoID else { return }
             metadataState = .available(metadata)
             selectedTimestampSeconds = clampedTimestamp(selectedTimestampSeconds)
+            intervalStartSeconds = 0
+            intervalEndSeconds = metadata.durationSeconds
+            updateSequenceValidation()
         } catch {
             guard activeVideoID == videoID else { return }
             metadataState = .failed(message: "The video metadata could not be loaded.")
@@ -179,13 +227,144 @@ final class SwingImportViewModel {
     private func clearInspectionState() {
         metadataState = .idle
         selectedTimestampSeconds = 0
+        intervalStartSeconds = 0
+        intervalEndSeconds = 0
         frameExtractionState = .idle
         activeFrameID = UUID()
         clearPoseState()
+        clearPoseTrackState()
     }
 
     private func clearPoseState() {
         poseAnalysisState = .noExtractedFrame
+    }
+
+    func setIntervalStart(_ seconds: Double) {
+        intervalStartSeconds = clampedTimestamp(seconds)
+        if intervalEndSeconds <= intervalStartSeconds {
+            intervalEndSeconds = min(currentDurationSeconds, intervalStartSeconds + 0.01)
+        }
+        updateSequenceValidation()
+    }
+
+    func setIntervalEnd(_ seconds: Double) {
+        intervalEndSeconds = clampedTimestamp(seconds)
+        updateSequenceValidation()
+    }
+
+    func setSequenceSamplesPerSecond(_ samplesPerSecond: Double) {
+        sequenceSamplesPerSecond = max(0.1, samplesPerSecond)
+        updateSequenceValidation()
+    }
+
+    func startPoseTrackAnalysis() {
+        guard case .ready(let swing) = state else { return }
+        let videoID = activeVideoID
+        let trackID = UUID()
+        activeTrackID = trackID
+        selectedPoseSampleID = nil
+        selectedPoseSampleFrameState = .idle
+
+        let plan: PoseTrackSamplingPlan
+        do {
+            plan = try makeSamplingPlan()
+        } catch {
+            poseTrackAnalysisState = .failed(message: "Choose a valid interval before analyzing.")
+            return
+        }
+
+        sequenceValidationMessage = plan.wasReducedToMaximum ? "Sampling was reduced to stay within 150 samples." : nil
+        poseTrackTask?.cancel()
+        poseTrackAnalysisState = .analyzing(PoseTrackProgress(processedSamples: 0, totalSamples: plan.timestamps.count))
+
+        poseTrackTask = Task { [poseTrackAnalyzer, minimumPoseConfidence] in
+            do {
+                let track = try await poseTrackAnalyzer.analyze(
+                    videoURL: swing.localVideoURL,
+                    timestamps: plan.timestamps,
+                    minimumConfidence: minimumPoseConfidence
+                ) { [weak self] progress in
+                    guard let self, self.activeVideoID == videoID, self.activeTrackID == trackID else { return }
+                    self.poseTrackAnalysisState = .analyzing(progress)
+                }
+
+                guard activeVideoID == videoID, activeTrackID == trackID else { return }
+                poseTrackAnalysisState = .completed(track)
+                if let firstSample = track.samples.first {
+                    await selectPoseSample(firstSample)
+                }
+                poseTrackTask = nil
+            } catch is CancellationError {
+                guard activeVideoID == videoID, activeTrackID == trackID else { return }
+                poseTrackAnalysisState = .cancelled
+                poseTrackTask = nil
+            } catch {
+                guard activeVideoID == videoID, activeTrackID == trackID else { return }
+                poseTrackAnalysisState = .failed(message: "Sequence analysis failed. Try a shorter interval.")
+                poseTrackTask = nil
+            }
+        }
+    }
+
+    func cancelPoseTrackAnalysis() {
+        poseTrackTask?.cancel()
+        poseTrackTask = nil
+        activeTrackID = UUID()
+        poseTrackAnalysisState = .cancelled
+    }
+
+    func selectPoseSample(_ sample: PoseSample) async {
+        guard case .ready(let swing) = state else { return }
+        let videoID = activeVideoID
+        let trackID = activeTrackID
+        selectedPoseSampleID = sample.id
+        selectedPoseSampleFrameState = .loading
+
+        do {
+            let frame = try await videoProcessor.extractFrame(at: sample.actualTime, from: swing.localVideoURL)
+            guard activeVideoID == videoID, activeTrackID == trackID, selectedPoseSampleID == sample.id else { return }
+            selectedPoseSampleFrameState = .loaded(sample: sample, frame: frame)
+        } catch {
+            guard activeVideoID == videoID, activeTrackID == trackID, selectedPoseSampleID == sample.id else { return }
+            selectedPoseSampleFrameState = .failed(message: "The selected sample frame could not be loaded.")
+        }
+    }
+
+    private func clearPoseTrackState() {
+        poseTrackTask?.cancel()
+        activeTrackID = UUID()
+        sequenceValidationMessage = nil
+        poseTrackAnalysisState = .idle
+        selectedPoseSampleID = nil
+        selectedPoseSampleFrameState = .idle
+    }
+
+    private func makeSamplingPlan() throws -> PoseTrackSamplingPlan {
+        try PoseTrackSampler.makePlan(PoseTrackSamplingRequest(
+            startTime: intervalStartSeconds,
+            endTime: intervalEndSeconds,
+            samplesPerSecond: sequenceSamplesPerSecond,
+            durationSeconds: currentDurationSeconds,
+            maximumSamples: 150
+        ))
+    }
+
+    private func updateSequenceValidation() {
+        do {
+            let plan = try makeSamplingPlan()
+            sequenceValidationMessage = plan.wasReducedToMaximum ? "Sampling will be reduced to stay within 150 samples." : nil
+        } catch PoseTrackSamplingError.invalidInterval {
+            sequenceValidationMessage = "Start must be before end, and both must be within the video duration."
+        } catch {
+            sequenceValidationMessage = "Choose a valid sampling rate."
+        }
+    }
+
+    private var currentDurationSeconds: Double {
+        if case .available(let metadata) = metadataState {
+            return metadata.durationSeconds
+        }
+        return 0
     }
 
     private func clampedTimestamp(_ timestampSeconds: Double) -> Double {

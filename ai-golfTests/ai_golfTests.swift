@@ -402,6 +402,166 @@ struct ai_golfTests {
         #expect(viewModel.poseAnalysisState == .noExtractedFrame)
     }
 
+    @Test func samplingTimestampGenerationIncludesBounds() throws {
+        let plan = try PoseTrackSampler.makePlan(PoseTrackSamplingRequest(startTime: 1, endTime: 2, samplesPerSecond: 2, durationSeconds: 5, maximumSamples: 150))
+
+        #expect(plan.timestamps == [1, 1.5, 2])
+        #expect(plan.effectiveSamplesPerSecond == 2)
+        #expect(!plan.wasReducedToMaximum)
+    }
+
+    @Test func maximumSampleEnforcementReducesEffectiveRate() throws {
+        let plan = try PoseTrackSampler.makePlan(PoseTrackSamplingRequest(startTime: 0, endTime: 20, samplesPerSecond: 10, durationSeconds: 20, maximumSamples: 150))
+
+        #expect(plan.timestamps.count == 150)
+        #expect(plan.wasReducedToMaximum)
+        #expect(plan.effectiveSamplesPerSecond < 10)
+    }
+
+    @Test func nonIntegralIntervalDoesNotExceedRequestedSamplingRate() throws {
+        let plan = try PoseTrackSampler.makePlan(PoseTrackSamplingRequest(startTime: 0, endTime: 1.01, samplesPerSecond: 10, durationSeconds: 2, maximumSamples: 150))
+
+        #expect(plan.timestamps.count == 11)
+        #expect(plan.effectiveSamplesPerSecond <= 10)
+    }
+
+    @Test func invalidIntervalIsRejected() {
+        #expect(throws: PoseTrackSamplingError.invalidInterval) {
+            try PoseTrackSampler.makePlan(PoseTrackSamplingRequest(startTime: 5, endTime: 5, samplesPerSecond: 10, durationSeconds: 10, maximumSamples: 150))
+        }
+    }
+
+    @Test func poseQualityClassificationAndMissingJoints() {
+        let complete = PoseSampleQualityEvaluator.evaluate(pose: Self.makeCompletePose())
+        let partial = PoseSampleQualityEvaluator.evaluate(pose: Self.makePose())
+        let noPose = PoseSampleQualityEvaluator.evaluate(pose: nil)
+
+        #expect(complete.category == .complete)
+        #expect(partial.category == .partial)
+        #expect(noPose.category == .noPose)
+        #expect(partial.missingJoints.contains(.leftElbow))
+        #expect(partial.hasSufficientTorso)
+        #expect(!partial.hasSufficientBothArms)
+    }
+
+    @Test func progressCalculation() {
+        let progress = PoseTrackProgress(processedSamples: 3, totalSamples: 10)
+
+        #expect(progress.fractionCompleted == 0.3)
+    }
+
+    @Test func swingPoseTrackSummaryStatisticsAreConsistent() {
+        let track = SwingPoseTrack(samples: [
+            PoseSample(id: UUID(), requestedTime: 0, actualTime: 0, pose: Self.makeCompletePose(), quality: PoseSampleQualityEvaluator.evaluate(pose: Self.makeCompletePose())),
+            PoseSample(id: UUID(), requestedTime: 1, actualTime: 1, pose: Self.makePose(), quality: PoseSampleQualityEvaluator.evaluate(pose: Self.makePose())),
+            PoseSample(id: UUID(), requestedTime: 2, actualTime: 2, pose: nil, quality: PoseSampleQualityEvaluator.evaluate(pose: nil))
+        ], processingDurationSeconds: 0.9)
+
+        let summary = track.summary
+
+        #expect(summary.totalSamples == 3)
+        #expect(summary.samplesWithPose == 2)
+        #expect(summary.samplesWithoutPose == 1)
+        #expect(summary.completeSamples == 1)
+        #expect(summary.partialSamples == 1)
+        #expect(summary.averageProcessingTimePerSample == 0.3)
+    }
+
+    @Test @MainActor func mixedSuccessfulAndNoPoseSamplesProduceCompletedTrack() async throws {
+        let track = Self.makeTrack(samples: [Self.makeSample(time: 0, pose: Self.makePose()), Self.makeSample(time: 1, pose: nil)])
+        let analyzer = StubPoseTrackAnalyzer(result: .success(track))
+        let viewModel = Self.makeSequenceViewModel(analyzer: analyzer)
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysis()
+        await analyzer.complete()
+        await Task.yield()
+
+        #expect(viewModel.poseTrackAnalysisState == .completed(track))
+    }
+
+    @Test @MainActor func cancellationKeepsImportedVideoIntact() async throws {
+        let analyzer = StubPoseTrackAnalyzer(result: .success(Self.makeTrack(samples: [])))
+        let viewModel = Self.makeSequenceViewModel(analyzer: analyzer)
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysis()
+        viewModel.cancelPoseTrackAnalysis()
+
+        guard case .ready(let swing) = viewModel.state else {
+            Issue.record("Expected imported video to remain")
+            return
+        }
+        #expect(FileManager.default.fileExists(atPath: swing.localVideoURL.path()))
+        #expect(viewModel.poseTrackAnalysisState == .cancelled)
+    }
+
+    @Test @MainActor func stalePoseTrackResultCannotOverwriteNewerResult() async throws {
+        let analyzer = QueuePoseTrackAnalyzer()
+        let viewModel = Self.makeSequenceViewModel(analyzer: analyzer)
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+        let oldTrack = Self.makeTrack(samples: [Self.makeSample(time: 0, pose: nil)])
+        let newTrack = Self.makeTrack(samples: [Self.makeSample(time: 1, pose: Self.makePose())])
+
+        await viewModel.importVideo { sourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysisCount(1)
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysisCount(2)
+
+        await analyzer.completeAnalysis(at: 1, with: .success(newTrack))
+        await analyzer.completeAnalysis(at: 0, with: .success(oldTrack))
+        await Task.yield()
+
+        #expect(viewModel.poseTrackAnalysisState == .completed(newTrack))
+    }
+
+    @Test @MainActor func videoReplacementClearsPoseTrack() async throws {
+        let track = Self.makeTrack(samples: [Self.makeSample(time: 0, pose: Self.makePose())])
+        let analyzer = StubPoseTrackAnalyzer(result: .success(track))
+        let viewModel = Self.makeSequenceViewModel(analyzer: analyzer)
+        let firstSourceURL = try Self.makeVideoFile(named: "first.mov", contents: "first")
+        let secondSourceURL = try Self.makeVideoFile(named: "second.mov", contents: "second")
+
+        await viewModel.importVideo { firstSourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysis()
+        await analyzer.complete()
+        await Task.yield()
+        #expect(viewModel.poseTrackAnalysisState == .completed(track))
+
+        await viewModel.importVideo { secondSourceURL }
+
+        #expect(viewModel.poseTrackAnalysisState == .idle)
+    }
+
+    @Test @MainActor func selectedSampleLoadsReviewFrame() async throws {
+        let sample = PoseSample(
+            id: UUID(),
+            requestedTime: 2,
+            actualTime: 2.05,
+            pose: Self.makePose(),
+            quality: PoseSampleQualityEvaluator.evaluate(pose: Self.makePose())
+        )
+        let viewModel = Self.makeSequenceViewModel(analyzer: StubPoseTrackAnalyzer(result: .success(Self.makeTrack(samples: [sample]))))
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        await viewModel.selectPoseSample(sample)
+
+        guard case .loaded(let loadedSample, let frame) = viewModel.selectedPoseSampleFrameState else {
+            Issue.record("Expected selected sample frame")
+            return
+        }
+
+        #expect(loadedSample == sample)
+        #expect(frame.requestedTimestampSeconds == 2.05)
+    }
+
     private enum TestImportError: Error {
         case failed
     }
@@ -409,7 +569,7 @@ struct ai_golfTests {
     private final class StubVideoProcessor: SwingVideoProcessing {
         let metadata: SwingVideoMetadata
         private let metadataResult: Result<SwingVideoMetadata, Error>
-        private let frameResult: Result<SwingExtractedFrame, Error>
+        private let frameResult: Result<SwingExtractedFrame, Error>?
 
         init(
             metadata: SwingVideoMetadata = SwingVideoMetadata(durationSeconds: 10, width: 1920, height: 1080, nominalFrameRate: 30, hasUsableVideoTrack: true),
@@ -418,7 +578,7 @@ struct ai_golfTests {
         ) {
             self.metadata = metadata
             self.metadataResult = metadataResult ?? .success(metadata)
-            self.frameResult = frameResult ?? .success(try! ai_golfTests.makeFrame(requestedTimestampSeconds: 1, actualTimestampSeconds: 1))
+            self.frameResult = frameResult
         }
 
         func inspectVideo(at url: URL) async throws -> SwingVideoMetadata {
@@ -426,7 +586,10 @@ struct ai_golfTests {
         }
 
         func extractFrame(at timestampSeconds: Double, from url: URL) async throws -> SwingExtractedFrame {
-            try frameResult.get()
+            if let frameResult {
+                return try frameResult.get()
+            }
+            return try ai_golfTests.makeFrame(requestedTimestampSeconds: timestampSeconds, actualTimestampSeconds: timestampSeconds)
         }
 
     }
@@ -440,6 +603,63 @@ struct ai_golfTests {
 
         func detectPose(in image: CGImage, minimumConfidence: Double) async throws -> DetectedPose? {
             try result.get()
+        }
+    }
+
+    private final class StubPoseTrackAnalyzer: SwingPoseTrackAnalyzing, @unchecked Sendable {
+        private let result: Result<SwingPoseTrack, Error>
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        init(result: Result<SwingPoseTrack, Error>) {
+            self.result = result
+        }
+
+        func analyze(videoURL: URL, timestamps: [Double], minimumConfidence: Double, progress: @MainActor @escaping (PoseTrackProgress) -> Void) async throws -> SwingPoseTrack {
+            progress(PoseTrackProgress(processedSamples: 0, totalSamples: timestamps.count))
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+            return try result.get()
+        }
+
+        func waitForAnalysis() async {
+            while continuation == nil {
+                await Task.yield()
+            }
+        }
+
+        func complete() async {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    private actor QueuePoseTrackAnalyzer: SwingPoseTrackAnalyzing {
+        private var continuations: [CheckedContinuation<SwingPoseTrack, Error>] = []
+        private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+        func analyze(videoURL: URL, timestamps: [Double], minimumConfidence: Double, progress: @MainActor @escaping (PoseTrackProgress) -> Void) async throws -> SwingPoseTrack {
+            try await withCheckedThrowingContinuation { continuation in
+                continuations.append(continuation)
+                resumeReadyWaiters()
+            }
+        }
+
+        func waitForAnalysisCount(_ expectedCount: Int) async {
+            if continuations.count >= expectedCount { return }
+            await withCheckedContinuation { continuation in
+                countWaiters.append((expectedCount, continuation))
+            }
+        }
+
+        func completeAnalysis(at index: Int, with result: Result<SwingPoseTrack, Error>) {
+            continuations[index].resume(with: result)
+        }
+
+        private func resumeReadyWaiters() {
+            let readyWaiters = countWaiters.filter { continuations.count >= $0.0 }
+            countWaiters.removeAll { continuations.count >= $0.0 }
+            readyWaiters.forEach { $0.1.resume() }
         }
     }
 
@@ -582,10 +802,44 @@ struct ai_golfTests {
             points: [
                 .leftShoulder: PosePoint(joint: .leftShoulder, x: 0.3, y: 0.3, confidence: 0.8),
                 .rightShoulder: PosePoint(joint: .rightShoulder, x: 0.7, y: 0.3, confidence: 0.8),
+                .neck: PosePoint(joint: .neck, x: 0.5, y: 0.25, confidence: 0.8),
+                .root: PosePoint(joint: .root, x: 0.5, y: 0.6, confidence: 0.8),
                 .leftHip: PosePoint(joint: .leftHip, x: 0.35, y: 0.65, confidence: 0.7),
                 .rightHip: PosePoint(joint: .rightHip, x: 0.65, y: 0.65, confidence: 0.7)
             ],
             minimumConfidence: minimumConfidence
+        )
+    }
+
+    private static func makeCompletePose(minimumConfidence: Double = 0.3) -> DetectedPose {
+        DetectedPose(
+            points: Dictionary(uniqueKeysWithValues: BodyJoint.allCases.map { joint in
+                (joint, PosePoint(joint: joint, x: 0.5, y: 0.5, confidence: 0.9))
+            }),
+            minimumConfidence: minimumConfidence
+        )
+    }
+
+    private static func makeSample(time: Double, pose: DetectedPose?) -> PoseSample {
+        PoseSample(
+            id: UUID(),
+            requestedTime: time,
+            actualTime: time,
+            pose: pose,
+            quality: PoseSampleQualityEvaluator.evaluate(pose: pose)
+        )
+    }
+
+    private static func makeTrack(samples: [PoseSample]) -> SwingPoseTrack {
+        SwingPoseTrack(samples: samples, processingDurationSeconds: 1)
+    }
+
+    @MainActor private static func makeSequenceViewModel(analyzer: SwingPoseTrackAnalyzing) -> SwingImportViewModel {
+        SwingImportViewModel(
+            importDirectory: temporaryDirectory(),
+            videoProcessor: StubVideoProcessor(metadata: SwingVideoMetadata(durationSeconds: 10, width: 1920, height: 1080, nominalFrameRate: 30, hasUsableVideoTrack: true)),
+            poseEstimator: StubPoseEstimator(result: .success(makePose())),
+            poseTrackAnalyzer: analyzer
         )
     }
 }
