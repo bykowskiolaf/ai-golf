@@ -72,12 +72,18 @@ struct SwingImportView: View {
             .frame(minHeight: 320)
 
         case .ready(let swing):
-            SwingVideoPlayer(url: swing.localVideoURL)
-                .clipShape(RoundedRectangle(cornerRadius: 16))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(.quaternary, lineWidth: 1)
-                }
+            VStack(alignment: .leading, spacing: 20) {
+                SwingVideoPlayer(url: swing.localVideoURL)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(.quaternary, lineWidth: 1)
+                    }
+
+                metadataContent
+                frameExtractionControls
+                extractedFrameContent
+            }
 
         case .failed(let message):
             ContentUnavailableView(
@@ -96,6 +102,137 @@ struct SwingImportView: View {
         default:
             "Choose Swing Video"
         }
+    }
+
+    @ViewBuilder
+    private var metadataContent: some View {
+        switch viewModel.metadataState {
+        case .idle:
+            EmptyView()
+
+        case .loading:
+            Label("Inspecting video metadata...", systemImage: "info.circle")
+                .foregroundStyle(.secondary)
+
+        case .available(let metadata):
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Video Metadata")
+                    .font(.headline)
+
+                Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                    metadataRow("Duration", "\(formatSeconds(metadata.durationSeconds)) seconds")
+                    metadataRow("Dimensions", "\(metadata.width) x \(metadata.height)")
+                    metadataRow("Frame Rate", "\(formatFrameRate(metadata.nominalFrameRate)) fps")
+                    metadataRow("Video Track", metadata.hasUsableVideoTrack ? "Usable" : "Not usable")
+                }
+                .font(.subheadline)
+
+                if metadata.isHighFrameRateSource {
+                    Label("High-frame-rate source", systemImage: "speedometer")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private func metadataRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Text(value)
+        }
+    }
+
+    @ViewBuilder
+    private var frameExtractionControls: some View {
+        if case .available(let metadata) = viewModel.metadataState {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Selected Timestamp")
+                        .font(.headline)
+                    Spacer()
+                    Text(formatSeconds(viewModel.selectedTimestampSeconds))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(
+                    value: Binding(
+                        get: { viewModel.selectedTimestampSeconds },
+                        set: { viewModel.setSelectedTimestamp($0) }
+                    ),
+                    in: 0...metadata.durationSeconds
+                )
+
+                Button {
+                    Task { await viewModel.extractFrame() }
+                } label: {
+                    Label("Extract Frame", systemImage: "photo")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isExtractingFrame)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var extractedFrameContent: some View {
+        switch viewModel.frameExtractionState {
+        case .idle:
+            EmptyView()
+
+        case .extracting:
+            HStack(spacing: 12) {
+                ProgressView()
+                Text("Extracting frame...")
+                    .foregroundStyle(.secondary)
+            }
+
+        case .extracted(let frame):
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Extracted Frame")
+                    .font(.headline)
+                Image(decorative: frame.image, scale: 1)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(.quaternary, lineWidth: 1)
+                    }
+                Text("Requested \(formatSeconds(frame.requestedTimestampSeconds))s, received \(formatSeconds(frame.actualTimestampSeconds))s")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private var isExtractingFrame: Bool {
+        if case .extracting = viewModel.frameExtractionState {
+            return true
+        }
+        return false
+    }
+
+    private func formatSeconds(_ seconds: Double) -> String {
+        seconds.formatted(.number.precision(.fractionLength(2)))
+    }
+
+    private func formatFrameRate(_ frameRate: Float) -> String {
+        Double(frameRate).formatted(.number.precision(.fractionLength(0...2)))
     }
 }
 
