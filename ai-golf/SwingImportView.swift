@@ -201,18 +201,94 @@ struct SwingImportView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Extracted Frame")
                     .font(.headline)
-                Image(decorative: frame.image, scale: 1)
-                    .resizable()
-                    .scaledToFit()
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(.quaternary, lineWidth: 1)
-                    }
+                extractedFrameImage(frame)
                 Text("Requested \(formatSeconds(frame.requestedTimestampSeconds))s, received \(formatSeconds(frame.actualTimestampSeconds))s")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                poseControls
             }
+
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+    }
+
+    private func extractedFrameImage(_ frame: SwingExtractedFrame) -> some View {
+        let imageSize = CGSize(width: frame.image.width, height: frame.image.height)
+
+        return Image(decorative: frame.image, scale: 1)
+            .resizable()
+            .scaledToFit()
+            .overlay {
+                if viewModel.isPoseOverlayVisible, case .detected(let pose) = viewModel.poseAnalysisState {
+                    PoseSkeletonOverlay(pose: pose, imageSize: imageSize)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(.quaternary, lineWidth: 1)
+            }
+    }
+
+    @ViewBuilder
+    private var poseControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Button {
+                    Task { await viewModel.analyzePose() }
+                } label: {
+                    Label("Analyze Pose", systemImage: "figure.stand")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isAnalyzingPose)
+
+                Toggle("Overlay", isOn: Binding(
+                    get: { viewModel.isPoseOverlayVisible },
+                    set: { viewModel.isPoseOverlayVisible = $0 }
+                ))
+                .labelsHidden()
+                .disabled(!hasPoseOverlay)
+            }
+
+            poseStatus
+        }
+    }
+
+    @ViewBuilder
+    private var poseStatus: some View {
+        switch viewModel.poseAnalysisState {
+        case .noExtractedFrame:
+            EmptyView()
+
+        case .ready:
+            Text("Ready for pose analysis. Threshold: \(formatConfidence(viewModel.minimumPoseConfidence))")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+        case .analyzing:
+            HStack(spacing: 12) {
+                ProgressView()
+                Text("Analyzing pose...")
+                    .foregroundStyle(.secondary)
+            }
+
+        case .detected(let pose):
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Pose detected")
+                    .font(.headline)
+                Text("Accepted joints: \(pose.acceptedJointCount)")
+                Text("Rejected or unavailable joints: \(pose.rejectedOrUnavailableJointCount)")
+                Text("Confidence threshold: \(formatConfidence(pose.minimumConfidence))")
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+        case .noPoseDetected:
+            Label("No human pose detected in this frame.", systemImage: "person.crop.circle.badge.questionmark")
+                .foregroundStyle(.secondary)
 
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle")
@@ -227,12 +303,64 @@ struct SwingImportView: View {
         return false
     }
 
+    private var isAnalyzingPose: Bool {
+        if case .analyzing = viewModel.poseAnalysisState {
+            return true
+        }
+        return false
+    }
+
+    private var hasPoseOverlay: Bool {
+        if case .detected = viewModel.poseAnalysisState {
+            return true
+        }
+        return false
+    }
+
     private func formatSeconds(_ seconds: Double) -> String {
         seconds.formatted(.number.precision(.fractionLength(2)))
     }
 
     private func formatFrameRate(_ frameRate: Float) -> String {
         Double(frameRate).formatted(.number.precision(.fractionLength(0...2)))
+    }
+
+    private func formatConfidence(_ confidence: Double) -> String {
+        confidence.formatted(.number.precision(.fractionLength(2)))
+    }
+}
+
+private struct PoseSkeletonOverlay: View {
+    let pose: DetectedPose
+    let imageSize: CGSize
+
+    var body: some View {
+        GeometryReader { proxy in
+            let transform = PoseOverlayTransform(imageSize: imageSize, viewSize: proxy.size)
+            let acceptedPoints = pose.acceptedPoints
+            let connections = SwingPoseSkeleton.visibleConnections(for: pose)
+
+            Canvas { context, _ in
+                for connection in connections {
+                    guard let start = pose.points[connection.start],
+                          let end = pose.points[connection.end] else {
+                        continue
+                    }
+
+                    var path = Path()
+                    path.move(to: transform.viewPoint(for: start))
+                    path.addLine(to: transform.viewPoint(for: end))
+                    context.stroke(path, with: .color(.yellow), lineWidth: 3)
+                }
+
+                for point in acceptedPoints {
+                    let center = transform.viewPoint(for: point)
+                    let rect = CGRect(x: center.x - 4, y: center.y - 4, width: 8, height: 8)
+                    context.fill(Path(ellipseIn: rect), with: .color(.red))
+                }
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 

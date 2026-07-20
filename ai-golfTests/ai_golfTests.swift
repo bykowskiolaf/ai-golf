@@ -209,6 +209,199 @@ struct ai_golfTests {
         #expect(viewModel.metadataState == .available(secondMetadata))
     }
 
+    @Test @MainActor func staleImportCannotOverwriteNewerImport() async throws {
+        let importDirectory = Self.temporaryDirectory()
+        let processor = StubVideoProcessor()
+        let viewModel = SwingImportViewModel(importDirectory: importDirectory, videoProcessor: processor)
+        let firstSourceURL = try Self.makeVideoFile(named: "first.mov", contents: "first")
+        let secondSourceURL = try Self.makeVideoFile(named: "second.mov", contents: "second")
+        let firstSource = DeferredSourceURL()
+        let secondSource = DeferredSourceURL()
+
+        let firstImport = Task { await viewModel.importVideo { try await firstSource.load() } }
+        await firstSource.waitForLoad()
+
+        let secondImport = Task { await viewModel.importVideo { try await secondSource.load() } }
+        await secondSource.waitForLoad()
+
+        await secondSource.complete(with: .success(secondSourceURL))
+        await secondImport.value
+
+        guard case .ready(let secondSwing) = viewModel.state else {
+            Issue.record("Expected second import to be ready")
+            return
+        }
+        #expect(try Data(contentsOf: secondSwing.localVideoURL) == Data("second".utf8))
+
+        await firstSource.complete(with: .success(firstSourceURL))
+        await firstImport.value
+
+        guard case .ready(let currentSwing) = viewModel.state else {
+            Issue.record("Expected newer import to remain ready")
+            return
+        }
+
+        #expect(currentSwing.localVideoURL == secondSwing.localVideoURL)
+        #expect(FileManager.default.fileExists(atPath: secondSwing.localVideoURL.path()))
+        #expect(try Data(contentsOf: currentSwing.localVideoURL) == Data("second".utf8))
+    }
+
+    @Test func confidenceFilteringCountsAcceptedAndRejectedJoints() {
+        let pose = DetectedPose(
+            points: [
+                .leftShoulder: PosePoint(joint: .leftShoulder, x: 0.2, y: 0.3, confidence: 0.8),
+                .rightShoulder: PosePoint(joint: .rightShoulder, x: 0.8, y: 0.3, confidence: 0.2)
+            ],
+            minimumConfidence: 0.5
+        )
+
+        #expect(pose.acceptedJointCount == 1)
+        #expect(pose.rejectedOrUnavailableJointCount == BodyJoint.allCases.count - 1)
+        #expect(pose.acceptedPoints.map(\.joint) == [.leftShoulder])
+    }
+
+    @Test func skeletonConnectionsRequireBothEndpointsAboveThreshold() {
+        let pose = DetectedPose(
+            points: [
+                .leftShoulder: PosePoint(joint: .leftShoulder, x: 0.2, y: 0.3, confidence: 0.8),
+                .leftElbow: PosePoint(joint: .leftElbow, x: 0.3, y: 0.5, confidence: 0.7),
+                .leftWrist: PosePoint(joint: .leftWrist, x: 0.4, y: 0.7, confidence: 0.1)
+            ],
+            minimumConfidence: 0.5
+        )
+
+        let visibleConnections = SwingPoseSkeleton.visibleConnections(for: pose)
+
+        #expect(visibleConnections.contains(SkeletonConnection(start: .leftShoulder, end: .leftElbow)))
+        #expect(!visibleConnections.contains(SkeletonConnection(start: .leftElbow, end: .leftWrist)))
+    }
+
+    @Test func visionCoordinatesConvertToTopLeftAppCoordinates() {
+        #expect(PoseCoordinateSystem.appY(fromVisionY: 0) == 1)
+        #expect(PoseCoordinateSystem.appY(fromVisionY: 0.25) == 0.75)
+        #expect(PoseCoordinateSystem.appY(fromVisionY: 1) == 0)
+    }
+
+    @Test func aspectFitTransformHandlesHorizontalLetterboxing() {
+        let transform = PoseOverlayTransform(imageSize: CGSize(width: 100, height: 100), viewSize: CGSize(width: 200, height: 100))
+        let point = PosePoint(joint: .nose, x: 0.5, y: 0.5, confidence: 1)
+
+        #expect(transform.fittedImageRect == CGRect(x: 50, y: 0, width: 100, height: 100))
+        #expect(transform.viewPoint(for: point) == CGPoint(x: 100, y: 50))
+    }
+
+    @Test func aspectFitTransformHandlesVerticalLetterboxing() {
+        let transform = PoseOverlayTransform(imageSize: CGSize(width: 100, height: 100), viewSize: CGSize(width: 100, height: 200))
+        let point = PosePoint(joint: .nose, x: 0.5, y: 0.5, confidence: 1)
+
+        #expect(transform.fittedImageRect == CGRect(x: 0, y: 50, width: 100, height: 100))
+        #expect(transform.viewPoint(for: point) == CGPoint(x: 50, y: 100))
+    }
+
+    @Test @MainActor func successfulPoseAnalysisTransitionsToDetected() async throws {
+        let pose = Self.makePose()
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: StubVideoProcessor(),
+            poseEstimator: StubPoseEstimator(result: .success(pose))
+        )
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        await viewModel.extractFrame()
+        await viewModel.analyzePose()
+
+        #expect(viewModel.poseAnalysisState == .detected(pose))
+    }
+
+    @Test @MainActor func noPoseAnalysisTransitionsToNoPoseDetected() async throws {
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: StubVideoProcessor(),
+            poseEstimator: StubPoseEstimator(result: .success(nil))
+        )
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        await viewModel.extractFrame()
+        await viewModel.analyzePose()
+
+        #expect(viewModel.poseAnalysisState == .noPoseDetected)
+    }
+
+    @Test @MainActor func poseFailureDoesNotRemoveImportedVideoOrExtractedFrame() async throws {
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: StubVideoProcessor(),
+            poseEstimator: StubPoseEstimator(result: .failure(TestImportError.failed))
+        )
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        await viewModel.extractFrame()
+        await viewModel.analyzePose()
+
+        guard case .ready(let swing) = viewModel.state else {
+            Issue.record("Expected imported video to remain available")
+            return
+        }
+        guard case .extracted = viewModel.frameExtractionState else {
+            Issue.record("Expected extracted frame to remain available")
+            return
+        }
+
+        #expect(FileManager.default.fileExists(atPath: swing.localVideoURL.path()))
+        #expect(viewModel.poseAnalysisState == .failed(message: "Pose analysis failed. Try another frame."))
+    }
+
+    @Test @MainActor func stalePoseResultCannotOverwriteNewerExtractedFrame() async throws {
+        let poseEstimator = DeferredPoseEstimator()
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: StubVideoProcessor(),
+            poseEstimator: poseEstimator
+        )
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        await viewModel.extractFrame()
+        let analysis = Task { await viewModel.analyzePose() }
+        await poseEstimator.waitForAnalysisCount(1)
+
+        await viewModel.extractFrame()
+        #expect(viewModel.poseAnalysisState == .ready)
+
+        await poseEstimator.completeAnalysis(at: 0, with: .success(Self.makePose()))
+        await analysis.value
+
+        #expect(viewModel.poseAnalysisState == .ready)
+    }
+
+    @Test @MainActor func extractingOrImportingNewMediaClearsOldPose() async throws {
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: StubVideoProcessor(),
+            poseEstimator: StubPoseEstimator(result: .success(Self.makePose()))
+        )
+        let firstSourceURL = try Self.makeVideoFile(named: "first.mov", contents: "first")
+        let secondSourceURL = try Self.makeVideoFile(named: "second.mov", contents: "second")
+
+        await viewModel.importVideo { firstSourceURL }
+        await viewModel.extractFrame()
+        await viewModel.analyzePose()
+        guard case .detected = viewModel.poseAnalysisState else {
+            Issue.record("Expected pose result before clearing")
+            return
+        }
+
+        await viewModel.extractFrame()
+        #expect(viewModel.poseAnalysisState == .ready)
+
+        await viewModel.analyzePose()
+        await viewModel.importVideo { secondSourceURL }
+        #expect(viewModel.poseAnalysisState == .noExtractedFrame)
+    }
+
     private enum TestImportError: Error {
         case failed
     }
@@ -236,6 +429,49 @@ struct ai_golfTests {
             try frameResult.get()
         }
 
+    }
+
+    private final class StubPoseEstimator: PoseEstimating {
+        private let result: Result<DetectedPose?, Error>
+
+        init(result: Result<DetectedPose?, Error>) {
+            self.result = result
+        }
+
+        func detectPose(in image: CGImage, minimumConfidence: Double) async throws -> DetectedPose? {
+            try result.get()
+        }
+    }
+
+    private actor DeferredPoseEstimator: PoseEstimating {
+        private var analysisContinuations: [CheckedContinuation<DetectedPose?, Error>] = []
+        private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+        func detectPose(in image: CGImage, minimumConfidence: Double) async throws -> DetectedPose? {
+            try await withCheckedThrowingContinuation { continuation in
+                analysisContinuations.append(continuation)
+                resumeReadyWaiters()
+            }
+        }
+
+        func waitForAnalysisCount(_ expectedCount: Int) async {
+            if analysisContinuations.count >= expectedCount { return }
+
+            await withCheckedContinuation { continuation in
+                countWaiters.append((expectedCount, continuation))
+            }
+        }
+
+        func completeAnalysis(at index: Int, with result: Result<DetectedPose?, Error>) {
+            let continuation = analysisContinuations[index]
+            continuation.resume(with: result)
+        }
+
+        private func resumeReadyWaiters() {
+            let readyWaiters = countWaiters.filter { analysisContinuations.count >= $0.0 }
+            countWaiters.removeAll { analysisContinuations.count >= $0.0 }
+            readyWaiters.forEach { $0.1.resume() }
+        }
     }
 
     private actor DeferredVideoProcessor: SwingVideoProcessing {
@@ -270,6 +506,32 @@ struct ai_golfTests {
             let readyWaiters = countWaiters.filter { inspectionContinuations.count >= $0.0 }
             countWaiters.removeAll { inspectionContinuations.count >= $0.0 }
             readyWaiters.forEach { $0.1.resume() }
+        }
+    }
+
+    private actor DeferredSourceURL {
+        private var continuation: CheckedContinuation<URL, Error>?
+        private var loadWaiter: CheckedContinuation<Void, Never>?
+
+        func load() async throws -> URL {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                loadWaiter?.resume()
+                loadWaiter = nil
+            }
+        }
+
+        func waitForLoad() async {
+            if continuation != nil { return }
+
+            await withCheckedContinuation { continuation in
+                loadWaiter = continuation
+            }
+        }
+
+        func complete(with result: Result<URL, Error>) {
+            continuation?.resume(with: result)
+            continuation = nil
         }
     }
 
@@ -312,6 +574,18 @@ struct ai_golfTests {
             image: image,
             requestedTimestampSeconds: requestedTimestampSeconds,
             actualTimestampSeconds: actualTimestampSeconds
+        )
+    }
+
+    private static func makePose(minimumConfidence: Double = 0.3) -> DetectedPose {
+        DetectedPose(
+            points: [
+                .leftShoulder: PosePoint(joint: .leftShoulder, x: 0.3, y: 0.3, confidence: 0.8),
+                .rightShoulder: PosePoint(joint: .rightShoulder, x: 0.7, y: 0.3, confidence: 0.8),
+                .leftHip: PosePoint(joint: .leftHip, x: 0.35, y: 0.65, confidence: 0.7),
+                .rightHip: PosePoint(joint: .rightHip, x: 0.65, y: 0.65, confidence: 0.7)
+            ],
+            minimumConfidence: minimumConfidence
         )
     }
 }

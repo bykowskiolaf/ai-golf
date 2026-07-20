@@ -25,16 +25,30 @@ final class SwingImportViewModel {
         case failed(message: String)
     }
 
+    enum PoseAnalysisState: Equatable {
+        case noExtractedFrame
+        case ready
+        case analyzing
+        case detected(DetectedPose)
+        case noPoseDetected
+        case failed(message: String)
+    }
+
     private let fileManager: FileManager
     private let importDirectory: URL
     private let videoProcessor: SwingVideoProcessing
+    private let poseEstimator: PoseEstimating
     private var currentImportedFile: URL?
     private var activeVideoID = UUID()
+    private var activeFrameID = UUID()
 
     private(set) var state: State = .empty
     private(set) var metadataState: MetadataState = .idle
     private(set) var selectedTimestampSeconds = 0.0
     private(set) var frameExtractionState: FrameExtractionState = .idle
+    private(set) var poseAnalysisState: PoseAnalysisState = .noExtractedFrame
+    var minimumPoseConfidence = 0.3
+    var isPoseOverlayVisible = true
 
     init(
         importDirectory: URL = FileManager.default.temporaryDirectory
@@ -44,6 +58,7 @@ final class SwingImportViewModel {
         self.importDirectory = importDirectory
         self.fileManager = fileManager
         self.videoProcessor = AVFoundationSwingVideoProcessor()
+        self.poseEstimator = VisionPoseEstimator()
     }
 
     init(
@@ -54,6 +69,19 @@ final class SwingImportViewModel {
         self.importDirectory = importDirectory
         self.fileManager = fileManager
         self.videoProcessor = videoProcessor
+        self.poseEstimator = VisionPoseEstimator()
+    }
+
+    init(
+        importDirectory: URL,
+        fileManager: FileManager = .default,
+        videoProcessor: SwingVideoProcessing,
+        poseEstimator: PoseEstimating
+    ) {
+        self.importDirectory = importDirectory
+        self.fileManager = fileManager
+        self.videoProcessor = videoProcessor
+        self.poseEstimator = poseEstimator
     }
 
     func importVideo(loadSourceURL: () async throws -> URL) async {
@@ -64,7 +92,14 @@ final class SwingImportViewModel {
 
         do {
             let sourceURL = try await loadSourceURL()
+            guard activeVideoID == videoID else { return }
+
             let importedURL = try copyIntoImportDirectory(sourceURL)
+            guard activeVideoID == videoID else {
+                try? fileManager.removeItem(at: importedURL)
+                return
+            }
+
             removeCurrentImportedFile()
 
             currentImportedFile = importedURL
@@ -89,14 +124,43 @@ final class SwingImportViewModel {
         let timestampSeconds = clampedTimestamp(selectedTimestampSeconds)
         selectedTimestampSeconds = timestampSeconds
         frameExtractionState = .extracting
+        clearPoseState()
+        let frameID = UUID()
+        activeFrameID = frameID
 
         do {
             let frame = try await videoProcessor.extractFrame(at: timestampSeconds, from: swing.localVideoURL)
-            guard activeVideoID == videoID else { return }
+            guard activeVideoID == videoID, activeFrameID == frameID else { return }
             frameExtractionState = .extracted(frame)
+            poseAnalysisState = .ready
         } catch {
-            guard activeVideoID == videoID else { return }
+            guard activeVideoID == videoID, activeFrameID == frameID else { return }
             frameExtractionState = .failed(message: "The frame could not be extracted. Try another timestamp.")
+            poseAnalysisState = .noExtractedFrame
+        }
+    }
+
+    func analyzePose() async {
+        guard case .extracted(let frame) = frameExtractionState else {
+            poseAnalysisState = .noExtractedFrame
+            return
+        }
+
+        let frameID = activeFrameID
+        poseAnalysisState = .analyzing
+
+        do {
+            let pose = try await poseEstimator.detectPose(in: frame.image, minimumConfidence: minimumPoseConfidence)
+            guard activeFrameID == frameID else { return }
+
+            if let pose {
+                poseAnalysisState = .detected(pose)
+            } else {
+                poseAnalysisState = .noPoseDetected
+            }
+        } catch {
+            guard activeFrameID == frameID else { return }
+            poseAnalysisState = .failed(message: "Pose analysis failed. Try another frame.")
         }
     }
 
@@ -116,6 +180,12 @@ final class SwingImportViewModel {
         metadataState = .idle
         selectedTimestampSeconds = 0
         frameExtractionState = .idle
+        activeFrameID = UUID()
+        clearPoseState()
+    }
+
+    private func clearPoseState() {
+        poseAnalysisState = .noExtractedFrame
     }
 
     private func clampedTimestamp(_ timestampSeconds: Double) -> Double {
