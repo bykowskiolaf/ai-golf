@@ -10,6 +10,15 @@ import CoreGraphics
 import Foundation
 @testable import ai_golf
 
+private extension SwingImportViewModel {
+    var readyAnnotationExport: SwingAnnotationDatasetExport? {
+        if case .readyToShare(let export) = annotationExportState {
+            return export
+        }
+        return nil
+    }
+}
+
 struct ai_golfTests {
 
     @Test @MainActor func initialStateIsEmpty() {
@@ -515,7 +524,7 @@ struct ai_golfTests {
 
         await analyzer.completeAnalysis(at: 1, with: .success(newTrack))
         await analyzer.completeAnalysis(at: 0, with: .success(oldTrack))
-        await Task.yield()
+        await Self.waitForPoseTrackCompletion(viewModel)
 
         #expect(viewModel.poseTrackAnalysisState == .completed(newTrack))
     }
@@ -560,6 +569,635 @@ struct ai_golfTests {
 
         #expect(loadedSample == sample)
         #expect(frame.requestedTimestampSeconds == 2.05)
+    }
+
+    @Test @MainActor func rapidSampleSelectionOnlyDisplaysLatestFrame() async throws {
+        let firstSample = Self.makeSample(time: 1, pose: Self.makePose())
+        let secondSample = Self.makeSample(time: 2, pose: Self.makePose())
+        let processor = DeferredFrameVideoProcessor()
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: processor,
+            poseEstimator: StubPoseEstimator(result: .success(Self.makePose())),
+            poseTrackAnalyzer: StubPoseTrackAnalyzer(result: .success(Self.makeTrack(samples: [firstSample, secondSample])))
+        )
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        viewModel.requestPoseSampleSelection(firstSample)
+        await Task.yield()
+        await processor.waitForFrameExtractionCount(1)
+        viewModel.requestPoseSampleSelection(secondSample)
+        await Task.yield()
+        await processor.waitForFrameExtractionCount(2)
+
+        await processor.completeFrameExtraction(at: 1)
+        await Task.yield()
+        await processor.completeFrameExtraction(at: 0)
+        await Task.yield()
+
+        guard case .loaded(let sample, let frame) = viewModel.selectedPoseSampleFrameState else {
+            Issue.record("Expected latest selected sample frame")
+            return
+        }
+
+        #expect(sample == secondSample)
+        #expect(frame.requestedTimestampSeconds == 2)
+    }
+
+    @Test @MainActor func defaultAnnotationStateIsEmpty() {
+        let viewModel = SwingImportViewModel(importDirectory: Self.temporaryDirectory())
+
+        #expect(viewModel.annotations.isEmpty)
+        #expect(!viewModel.annotationValidation.canExport)
+        #expect(SwingAnnotationRecord.schemaVersion == 2)
+    }
+
+    @Test @MainActor func assigningReplacingAndClearingAnnotationLabels() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track)
+
+        for (index, position) in SwingPosition.allCases.enumerated() {
+            viewModel.markSelectedSample(as: position, in: track)
+            if index + 1 < samples.count {
+                await viewModel.selectPoseSample(at: index + 1, in: track)
+            }
+        }
+
+        #expect(viewModel.annotations.count == 4)
+        #expect(viewModel.annotation(for: .address)?.actualTimestamp == 0.5)
+
+        await viewModel.selectPoseSample(at: 1, in: track)
+        viewModel.markSelectedSample(as: .address, in: track)
+        #expect(viewModel.annotation(for: .address)?.actualTimestamp == 1.5)
+
+        viewModel.clearAnnotation(.address)
+        #expect(viewModel.annotation(for: .address) == nil)
+    }
+
+    @Test @MainActor func jumpingToLabeledSampleLoadsItsFrame() async throws {
+        let samples = [0.5, 1.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track)
+
+        await viewModel.selectPoseSample(at: 1, in: track)
+        viewModel.markSelectedSample(as: .top, in: track)
+        await viewModel.selectPoseSample(at: 0, in: track)
+        viewModel.jumpToAnnotation(.top, in: track)
+        await Task.yield()
+
+        #expect(viewModel.selectedPoseSampleID == samples[1].id)
+    }
+
+    @Test @MainActor func chronologicalValidationAcceptsStrictOrderAndRejectsInvalidPairs() {
+        let valid = Self.makeAnnotationMap(times: [.address: 1, .top: 2, .impact: 3, .finish: 4])
+        #expect(SwingAnnotationBuilder.validate(annotations: valid).canExport)
+
+        let invalidAddressTop = Self.makeAnnotationMap(times: [.address: 2, .top: 2, .impact: 3, .finish: 4])
+        #expect(!SwingAnnotationBuilder.validate(annotations: invalidAddressTop).canExport)
+
+        let invalidTopImpact = Self.makeAnnotationMap(times: [.address: 1, .top: 4, .impact: 3, .finish: 5])
+        #expect(!SwingAnnotationBuilder.validate(annotations: invalidTopImpact).canExport)
+
+        let invalidImpactFinish = Self.makeAnnotationMap(times: [.address: 1, .top: 2, .impact: 5, .finish: 4])
+        #expect(!SwingAnnotationBuilder.validate(annotations: invalidImpactFinish).canExport)
+    }
+
+    @Test @MainActor func readinessClassificationsAndMissingWrists() {
+        let ready = Self.cleanedSample(joints: [.neck, .root, .leftShoulder, .rightShoulder, .leftHip, .rightHip, .leftElbow, .leftWrist])
+        #expect(SwingAnnotationBuilder.readiness(for: ready) == .poseReady)
+
+        let partial = Self.cleanedSample(joints: [.neck, .root, .leftShoulder, .rightShoulder, .leftHip, .rightHip, .leftElbow])
+        #expect(SwingAnnotationBuilder.readiness(for: partial) == .posePartial)
+        #expect(SwingAnnotationBuilder.availability(for: partial).bothWrists == false)
+
+        let visualOnly = Self.cleanedSample(joints: [.leftShoulder, .rightShoulder, .leftElbow])
+        #expect(SwingAnnotationBuilder.readiness(for: visualOnly) == .visualOnly)
+    }
+
+    @Test @MainActor func incompleteAnnotationCannotExport() {
+        let annotations = Self.makeAnnotationMap(times: [.address: 1, .top: 2])
+
+        #expect(throws: SwingAnnotationExportError.self) {
+            _ = try Self.makeAnnotationRecord(annotations: annotations)
+        }
+    }
+
+    @Test @MainActor func jsonEncodingPreservesSchemaCoordinatesAndProvenance() throws {
+        let annotations = Self.makeAnnotationMap(times: [.address: 1, .top: 2, .impact: 3, .finish: 4], includeInterpolatedWrist: true)
+        let record = try Self.makeAnnotationRecord(
+            context: SwingAnnotationContext(golferHandedness: .leftHanded, cameraView: .downTheLine, golfClub: .midIron),
+            annotations: annotations
+        )
+        let data = try JSONEncoder.swingAnnotationEncoder().encode(record)
+        let decoded = try JSONDecoder.swingAnnotationDecoder().decode(SwingAnnotationRecord.self, from: data)
+
+        #expect(decoded.schemaVersion == 2)
+        #expect(decoded.coordinateSystem == .normalizedTopLeft)
+        #expect(decoded.context.golferHandedness == .leftHanded)
+        #expect(decoded.positions.count == 4)
+        let address = try #require(decoded.positions.first { $0.position == "address" })
+        let wrist = try #require(address.cleanedJoints.first { $0.joint == BodyJoint.leftWrist.rawValue })
+        #expect(wrist.x == 0.2)
+        #expect(wrist.source == "interpolated")
+    }
+
+    @Test @MainActor func schemaVersionOnlyOccursAtRoot() throws {
+        let record = try Self.makeAnnotationRecord()
+        let data = try JSONEncoder.swingAnnotationEncoder().encode(record)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let context = try #require(object["context"] as? [String: Any])
+
+        #expect(object["schemaVersion"] as? Int == 2)
+        #expect(context["schemaVersion"] == nil)
+    }
+
+    @Test @MainActor func annotationIDLifecycleAcrossReexportAndInvalidation() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track)
+        let originalID = viewModel.annotationIdentity.annotationID
+
+        for (index, position) in SwingPosition.allCases.enumerated() {
+            await viewModel.selectPoseSample(at: index, in: track)
+            viewModel.markSelectedSample(as: position, in: track)
+        }
+
+        let labeledID = viewModel.annotationIdentity.annotationID
+        viewModel.updateAnnotationNote("Impact appears between samples", for: .impact)
+        viewModel.annotationContext.golferIdentifier = "Golfer A"
+
+        #expect(labeledID == originalID)
+        #expect(viewModel.annotationIdentity.annotationID == labeledID)
+
+        viewModel.setSequenceSamplesPerSecond(12)
+        #expect(viewModel.annotationIdentity.annotationID != labeledID)
+    }
+
+    @Test @MainActor func schemaV2EncodesISODateAnnotatorCoordinateAndConfiguration() throws {
+        let createdAt = ISO8601DateFormatter().date(from: "2026-07-21T10:30:00Z")!
+        var context = SwingAnnotationContext(golferHandedness: .rightHanded, cameraView: .downTheLine, golfClub: .hybrid)
+        context.annotatorIdentifier = "Coach 1"
+        context.annotatorRole = .coach
+        let configuration = ExportedAnalysisConfiguration(
+            intervalStartSeconds: 0,
+            intervalEndSeconds: 2,
+            requestedSamplingRate: 30,
+            analyzedSampleCount: 60,
+            confidenceThreshold: 0.3
+        )
+        let record = try Self.makeAnnotationRecord(
+            identity: SwingAnnotationIdentity(annotationID: UUID(uuidString: "550E8400-E29B-41D4-A716-446655440000")!, createdAt: createdAt),
+            sourceVideoFilename: "swing-550E8400-E29B-41D4-A716-446655440000.mov",
+            context: context,
+            analysisConfiguration: configuration
+        )
+        let data = try JSONEncoder.swingAnnotationEncoder().encode(record)
+        let json = String(decoding: data, as: UTF8.self)
+
+        #expect(json.contains("\"createdAt\" : \"2026-07-21T10:30:00Z\""))
+        #expect(json.contains("\"annotatorRole\" : \"coach\""))
+        #expect(json.contains("\"annotatorIdentifier\" : \"Coach 1\""))
+        #expect(json.contains("\"coordinateSystem\" : \"normalizedTopLeft\""))
+        #expect(record.analysisConfiguration.effectiveSamplingRate == 30)
+        #expect(record.analysisConfiguration.maximumInterpolationGapSamples == 2)
+        #expect(record.analysisConfiguration.smoothingWindowSize == 3)
+        #expect(record.analysisConfiguration.smoothingCenterWeight == 0.5)
+    }
+
+    @Test @MainActor func optionalAnnotatorIdentifierMayBeOmitted() throws {
+        var context = SwingAnnotationContext()
+        context.annotatorIdentifier = nil
+        context.annotatorRole = .unknown
+        let record = try Self.makeAnnotationRecord(context: context)
+        let data = try JSONEncoder.swingAnnotationEncoder().encode(record)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let decodedContext = try #require(object["context"] as? [String: Any])
+
+        #expect(decodedContext["annotatorRole"] as? String == "unknown")
+        #expect(decodedContext["annotatorIdentifier"] == nil)
+    }
+
+    @Test @MainActor func effectiveSamplingRateProtectsZeroDuration() {
+        let configuration = ExportedAnalysisConfiguration(
+            intervalStartSeconds: 2,
+            intervalEndSeconds: 2,
+            requestedSamplingRate: 30,
+            analyzedSampleCount: 10,
+            confidenceThreshold: 0.3
+        )
+
+        #expect(configuration.effectiveSamplingRate == 0)
+    }
+
+    @Test @MainActor func positionNoteRoundTripsAndWhitespaceNormalizes() throws {
+        var annotations = Self.makeAnnotationMap(times: [.address: 1, .top: 2, .impact: 3, .finish: 4])
+        annotations[.impact]?.note = " Impact appears between two analyzed samples. "
+        annotations[.finish]?.note = "   "
+        let record = try Self.makeAnnotationRecord(annotations: annotations)
+        let data = try JSONEncoder.swingAnnotationEncoder().encode(record)
+        let decoded = try JSONDecoder.swingAnnotationDecoder().decode(SwingAnnotationRecord.self, from: data)
+
+        #expect(decoded.positions.first { $0.position == "impact" }?.note == "Impact appears between two analyzed samples.")
+        #expect(decoded.positions.first { $0.position == "finish" }?.note == nil)
+    }
+
+    @Test @MainActor func unsupportedFutureSchemaFailsClearly() throws {
+        let json = """
+        { "schemaVersion": 99, "positions": [] }
+        """.data(using: .utf8)!
+
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.swingAnnotationDecoder().decode(SwingAnnotationRecord.self, from: json)
+        }
+    }
+
+    @Test @MainActor func matchedFilenamesPreserveVideoExtensionAndSourceFilename() throws {
+        let annotationID = UUID(uuidString: "550E8400-E29B-41D4-A716-446655440000")!
+        let exporter = SwingAnnotationDatasetExporter(stagingRoot: Self.temporaryDirectory())
+        let videoFilename = exporter.sourceVideoFilename(annotationID: annotationID, sourceVideoURL: URL(filePath: "/tmp/internal-source.MP4"))
+        let record = try Self.makeAnnotationRecord(
+            identity: SwingAnnotationIdentity(annotationID: annotationID, createdAt: Date(timeIntervalSince1970: 0)),
+            sourceVideoFilename: videoFilename
+        )
+
+        #expect(videoFilename == "swing-550E8400-E29B-41D4-A716-446655440000.mp4")
+        #expect(record.sourceVideoFilename == videoFilename)
+    }
+
+    @Test @MainActor func reexportKeepsAnnotationIDAndMatchedBaseName() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track)
+        await Self.markAllPositions(in: viewModel, track: track)
+        let annotationID = viewModel.annotationIdentity.annotationID
+
+        await viewModel.exportAnnotation()
+        let firstExport = try #require(viewModel.readyAnnotationExport)
+        viewModel.dismissAnnotationExport()
+        await viewModel.exportAnnotation()
+        let secondExport = try #require(viewModel.readyAnnotationExport)
+
+        #expect(viewModel.annotationIdentity.annotationID == annotationID)
+        #expect(firstExport.videoURL.lastPathComponent == "swing-\(annotationID.uuidString).mov")
+        #expect(secondExport.annotationURL.lastPathComponent == "swing-\(annotationID.uuidString).json")
+    }
+
+    @Test @MainActor func replacingSourceVideoCreatesNewAnnotationID() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track)
+        let originalID = viewModel.annotationIdentity.annotationID
+
+        let replacementURL = try Self.makeVideoFile(named: "replacement.mp4")
+        await viewModel.importVideo { replacementURL }
+
+        #expect(viewModel.annotationIdentity.annotationID != originalID)
+    }
+
+    @Test @MainActor func datasetExportCopiesVideoBytesAndWritesMatchedJSON() throws {
+        let stagingRoot = Self.temporaryDirectory()
+        let sourceVideoURL = try Self.makeVideoFile(named: "source.mov", bytes: [0, 1, 2, 3, 255])
+        let exporter = SwingAnnotationDatasetExporter(stagingRoot: stagingRoot)
+        let videoFilename = exporter.sourceVideoFilename(annotationID: UUID(uuidString: "550E8400-E29B-41D4-A716-446655440000")!, sourceVideoURL: sourceVideoURL)
+        let record = try Self.makeAnnotationRecord(sourceVideoFilename: videoFilename)
+        let export = try exporter.export(record: record, sourceVideoURL: sourceVideoURL)
+        let copiedBytes = try Data(contentsOf: export.videoURL)
+        let decoded = try JSONDecoder.swingAnnotationDecoder().decode(SwingAnnotationRecord.self, from: Data(contentsOf: export.annotationURL))
+
+        #expect(copiedBytes == Data([0, 1, 2, 3, 255]))
+        #expect(export.videoURL.deletingPathExtension().lastPathComponent == export.annotationURL.deletingPathExtension().lastPathComponent)
+        #expect(decoded.sourceVideoFilename == export.videoURL.lastPathComponent)
+        #expect(FileManager.default.fileExists(atPath: sourceVideoURL.path))
+    }
+
+    @Test @MainActor func datasetExportReportsVideoCopyAndJSONWriteFailures() throws {
+        let sourceVideoURL = try Self.makeVideoFile(named: "source.mov")
+        let record = try Self.makeAnnotationRecord()
+        let copyFailingExporter = SwingAnnotationDatasetExporter(
+            stagingRoot: Self.temporaryDirectory(),
+            copyItem: { _, _ in throw CocoaError(.fileNoSuchFile) }
+        )
+        let writeFailingExporter = SwingAnnotationDatasetExporter(
+            stagingRoot: Self.temporaryDirectory(),
+            writeData: { _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+
+        #expect(throws: SwingAnnotationDatasetExporter.ExportError.videoCopyFailed) {
+            _ = try copyFailingExporter.export(record: record, sourceVideoURL: sourceVideoURL)
+        }
+        #expect(throws: SwingAnnotationDatasetExporter.ExportError.jsonWriteFailed) {
+            _ = try writeFailingExporter.export(record: record, sourceVideoURL: sourceVideoURL)
+        }
+    }
+
+    @Test @MainActor func failedExportDoesNotClearAnnotations() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let failingExporter = SwingAnnotationDatasetExporter(
+            stagingRoot: Self.temporaryDirectory(),
+            writeData: { _, _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track, datasetExporter: failingExporter)
+        await Self.markAllPositions(in: viewModel, track: track)
+
+        await viewModel.exportAnnotation()
+
+        #expect(viewModel.annotations.count == 4)
+        if case .failed = viewModel.annotationExportState {
+            #expect(true)
+        } else {
+            Issue.record("Expected failed export state")
+        }
+    }
+
+    @Test @MainActor func staleExportCannotPresentFilesForReplacedVideo() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let copyStarted = DispatchSemaphore(value: 0)
+        let allowCopy = DispatchSemaphore(value: 0)
+        let blockingExporter = SwingAnnotationDatasetExporter(
+            stagingRoot: Self.temporaryDirectory(),
+            copyItem: { source, destination in
+                copyStarted.signal()
+                allowCopy.wait()
+                try FileManager.default.copyItem(at: source, to: destination)
+            }
+        )
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track, datasetExporter: blockingExporter)
+        await Self.markAllPositions(in: viewModel, track: track)
+
+        let exportTask = Task { await viewModel.exportAnnotation() }
+        _ = copyStarted.wait(timeout: .now() + 2)
+        let replacementURL = try Self.makeVideoFile(named: "replacement.mov")
+        await viewModel.importVideo { replacementURL }
+        allowCopy.signal()
+        await exportTask.value
+
+        if case .readyToShare = viewModel.annotationExportState {
+            Issue.record("Stale export should not be ready to share")
+        }
+    }
+
+    @Test @MainActor func exportStagingCleanupRemovesOldDirectories() throws {
+        let stagingRoot = Self.temporaryDirectory()
+        let exporter = SwingAnnotationDatasetExporter(stagingRoot: stagingRoot)
+        let oldDirectory = stagingRoot.appending(path: "old", directoryHint: .isDirectory)
+        let keptDirectory = stagingRoot.appending(path: "kept", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: keptDirectory, withIntermediateDirectories: true)
+
+        exporter.cleanupStagedExports(keeping: keptDirectory)
+
+        #expect(!FileManager.default.fileExists(atPath: oldDirectory.path))
+        #expect(FileManager.default.fileExists(atPath: keptDirectory.path))
+    }
+
+    @Test @MainActor func videoReplacementIntervalAndSamplingClearAnnotations() async throws {
+        let samples = [0.5, 1.5, 2.5, 3.5].map { Self.makeSample(time: $0, pose: Self.makeFullAnnotationPose()) }
+        let track = Self.makeTrack(samples: samples)
+        let viewModel = try await Self.makeCompletedAnnotationViewModel(track: track)
+
+        viewModel.markSelectedSample(as: .address, in: track)
+        #expect(!viewModel.annotations.isEmpty)
+        viewModel.setIntervalStart(0.1)
+        #expect(viewModel.annotations.isEmpty)
+
+        viewModel.markSelectedSample(as: .address, in: track)
+        viewModel.setSequenceSamplesPerSecond(12)
+        #expect(viewModel.annotations.isEmpty)
+
+        viewModel.markSelectedSample(as: .address, in: track)
+        let replacementURL = try Self.makeVideoFile(named: "replacement.mov")
+        await viewModel.importVideo { replacementURL }
+        #expect(viewModel.annotations.isEmpty)
+    }
+
+    @Test @MainActor func staleFrameLoadsDoNotAlterAnnotationLabels() async throws {
+        let firstSample = Self.makeSample(time: 1, pose: Self.makeFullAnnotationPose())
+        let secondSample = Self.makeSample(time: 2, pose: Self.makeFullAnnotationPose())
+        let processor = DeferredFrameVideoProcessor()
+        let track = Self.makeTrack(samples: [firstSample, secondSample])
+        let analyzer = StubPoseTrackAnalyzer(result: .success(track))
+        let viewModel = SwingImportViewModel(
+            importDirectory: Self.temporaryDirectory(),
+            videoProcessor: processor,
+            poseEstimator: StubPoseEstimator(result: .success(Self.makePose())),
+            poseTrackAnalyzer: analyzer
+        )
+        let sourceURL = try Self.makeVideoFile(named: "source.mov")
+
+        await viewModel.importVideo { sourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysis()
+        await analyzer.complete()
+        await Task.yield()
+        await processor.waitForFrameExtractionCount(1)
+        await processor.completeFrameExtraction(at: 0)
+        await Task.yield()
+        viewModel.requestPoseSampleSelection(firstSample)
+        await Task.yield()
+        await processor.waitForFrameExtractionCount(2)
+        viewModel.markSelectedSample(as: .address, in: track)
+        viewModel.requestPoseSampleSelection(secondSample)
+        await Task.yield()
+        await processor.waitForFrameExtractionCount(3)
+        await processor.completeFrameExtraction(at: 1)
+        await processor.completeFrameExtraction(at: 2)
+        await Task.yield()
+
+        #expect(viewModel.annotation(for: .address)?.sampleID == firstSample.id)
+    }
+
+    @Test func oneSampleInterpolationUsesLinearCoordinates() {
+        let observations = Self.makeJointSeries([0.2, nil, 0.4])
+
+        let result = PoseTrackCleaner.interpolateShortGaps(observations: observations, timestamps: [0, 1, 2])
+
+        #expect(abs((result[1][.leftWrist]?.x ?? 0) - 0.3) < 0.000001)
+        #expect(Self.isInterpolated(result[1][.leftWrist]))
+        #expect(result[1][.leftWrist]?.confidence == nil)
+    }
+
+    @Test func twoSampleInterpolationFillsBothMissingSamples() {
+        let observations = Self.makeJointSeries([0.2, nil, nil, 0.5])
+
+        let result = PoseTrackCleaner.interpolateShortGaps(observations: observations, timestamps: [0, 1, 2, 3])
+
+        #expect(result[1][.leftWrist]?.x == 0.3)
+        #expect(result[2][.leftWrist]?.x == 0.4)
+        #expect(Self.isInterpolated(result[1][.leftWrist]))
+        #expect(Self.isInterpolated(result[2][.leftWrist]))
+    }
+
+    @Test func gapExceedingInterpolationLimitRemainsUnavailable() {
+        let observations = Self.makeJointSeries([0.2, nil, nil, nil, 0.6])
+
+        let result = PoseTrackCleaner.interpolateShortGaps(observations: observations, timestamps: [0, 1, 2, 3, 4])
+
+        #expect(result[1][.leftWrist] == nil)
+        #expect(result[2][.leftWrist] == nil)
+        #expect(result[3][.leftWrist] == nil)
+    }
+
+    @Test func interpolationDoesNotExtrapolateLeadingOrTrailingGaps() {
+        let observations = Self.makeJointSeries([nil, 0.2, nil, 0.4, nil])
+
+        let result = PoseTrackCleaner.interpolateShortGaps(observations: observations, timestamps: [0, 1, 2, 3, 4])
+
+        #expect(result[0][.leftWrist] == nil)
+        #expect(Self.isInterpolated(result[2][.leftWrist]))
+        #expect(result[4][.leftWrist] == nil)
+    }
+
+    @Test func interpolationRespectsActualTimestamps() {
+        let observations = Self.makeJointSeries([0.2, nil, 0.8])
+
+        let result = PoseTrackCleaner.interpolateShortGaps(observations: observations, timestamps: [0, 1, 4])
+
+        #expect(abs((result[1][.leftWrist]?.x ?? 0) - 0.35) < 0.000001)
+    }
+
+    @Test func outlierRejectionRemovesSyntheticSpike() {
+        let observations = Self.makeJointSeries([0.2, 0.95, 0.22], includeBodyScale: true)
+
+        let result = PoseTrackCleaner.rejectOutliers(
+            observations: observations,
+            timestamps: [0, 1, 2],
+            bodyScale: 0.3,
+            configuration: PoseTrackCleaningConfiguration(outlierDistanceScaleThreshold: 1, outlierNeighborDistanceScaleThreshold: 2.5)
+        )
+
+        #expect(result.observations[1][.leftWrist] == nil)
+        #expect(result.rejectedCounts[.leftWrist] == 1)
+    }
+
+    @Test func legitimateFastMovementIsNotAutomaticallyRejected() {
+        let observations = Self.makeJointSeries([0.1, 0.5, 0.9], includeBodyScale: true)
+
+        let result = PoseTrackCleaner.rejectOutliers(
+            observations: observations,
+            timestamps: [0, 1, 2],
+            bodyScale: 0.3,
+            configuration: PoseTrackCleaningConfiguration(outlierDistanceScaleThreshold: 1, outlierNeighborDistanceScaleThreshold: 2.5)
+        )
+
+        #expect(result.observations[1][.leftWrist] != nil)
+        #expect(result.rejectedCounts[.leftWrist] == 0)
+    }
+
+    @Test func smoothingReducesJitterWithinContinuousSegment() {
+        let observations = Self.makeJointSeries([0.2, 0.5, 0.4])
+
+        let result = PoseTrackCleaner.smooth(observations: observations, timestamps: [0, 1, 2], neighborWeight: 0.25)
+
+        #expect(result[1][.leftWrist]?.x == 0.4)
+        #expect(Self.isObserved(result[1][.leftWrist]))
+    }
+
+    @Test func smoothingDoesNotCrossUnavailableGaps() {
+        let observations = Self.makeJointSeries([0.2, nil, 0.4, 0.6])
+
+        let result = PoseTrackCleaner.smooth(observations: observations, timestamps: [0, 1, 2, 3], neighborWeight: 0.25)
+
+        #expect(result[2][.leftWrist]?.x == 0.4)
+    }
+
+    @Test func derivedMidpointCalculationTracksInterpolatedInputs() {
+        let landmarks = PoseTrackCleaner.deriveLandmarks(from: [
+            .leftWrist: Self.tracked(x: 0.2, y: 0.4, source: .observed),
+            .rightWrist: Self.tracked(x: 0.6, y: 0.8, source: .interpolated)
+        ])
+
+        #expect(landmarks.wristMidpoint?.x == 0.4)
+        #expect(abs((landmarks.wristMidpoint?.y ?? 0) - 0.6) < 0.000001)
+        #expect(landmarks.wristMidpoint?.usesInterpolatedPoint == true)
+    }
+
+    @Test func derivedLandmarkMissingWhenInputAbsent() {
+        let landmarks = PoseTrackCleaner.deriveLandmarks(from: [
+            .leftWrist: Self.tracked(x: 0.2, y: 0.4)
+        ])
+
+        #expect(landmarks.wristMidpoint == nil)
+    }
+
+    @Test func zeroLengthVectorIsUnavailable() {
+        let landmarks = PoseTrackCleaner.deriveLandmarks(from: [
+            .leftShoulder: Self.tracked(x: 0.4, y: 0.4),
+            .rightShoulder: Self.tracked(x: 0.4, y: 0.4)
+        ])
+
+        #expect(landmarks.shoulderLine == nil)
+        #expect(landmarks.approximateShoulderWidth == nil)
+    }
+
+    @Test func coveragePercentagesAndLongestGapAreAccurate() {
+        let track = Self.makeTrack(samples: [
+            Self.makeSample(time: 0, pose: Self.makePose(with: [.leftWrist: (0.2, 0.5)])),
+            Self.makeSample(time: 1, pose: nil),
+            Self.makeSample(time: 2, pose: Self.makePose(with: [.leftWrist: (0.4, 0.5)])),
+            Self.makeSample(time: 3, pose: nil),
+            Self.makeSample(time: 4, pose: nil)
+        ])
+
+        let cleaned = PoseTrackCleaner.clean(track: track)
+        let coverage = cleaned.diagnostics.jointCoverage[.leftWrist]
+
+        #expect(coverage?.observedSampleCount == 2)
+        #expect(coverage?.interpolatedSampleCount == 1)
+        #expect(coverage?.unavailableSampleCount == 2)
+        #expect(coverage?.observedCoveragePercentage == 40)
+        #expect(coverage?.effectiveCoveragePercentage == 60)
+        #expect(coverage?.longestUnavailableGap == 2)
+    }
+
+    @Test func rejectedOutlierCountsAreReportedInDiagnostics() {
+        let track = Self.makeTrack(samples: [
+            Self.makeSample(time: 0, pose: Self.makePose(with: [.leftWrist: (0.2, 0.5)])),
+            Self.makeSample(time: 1, pose: Self.makePose(with: [.leftWrist: (0.95, 0.5)])),
+            Self.makeSample(time: 2, pose: Self.makePose(with: [.leftWrist: (0.22, 0.5)]))
+        ])
+
+        let cleaned = PoseTrackCleaner.clean(
+            track: track,
+            configuration: PoseTrackCleaningConfiguration(outlierDistanceScaleThreshold: 1, outlierNeighborDistanceScaleThreshold: 2.5)
+        )
+
+        #expect(cleaned.diagnostics.jointCoverage[.leftWrist]?.rejectedOutlierCount == 1)
+        #expect(cleaned.diagnostics.totalRejectedOutlierCount == 1)
+    }
+
+    @Test func rawTrackRemainsUnchangedAfterCleaning() {
+        let track = Self.makeTrack(samples: [
+            Self.makeSample(time: 0, pose: Self.makePose(with: [.leftWrist: (0.2, 0.5)])),
+            Self.makeSample(time: 1, pose: nil),
+            Self.makeSample(time: 2, pose: Self.makePose(with: [.leftWrist: (0.4, 0.5)]))
+        ])
+
+        _ = PoseTrackCleaner.clean(track: track)
+
+        #expect(track.samples[1].pose == nil)
+    }
+
+    @Test @MainActor func cleanedTrackClearsWhenSourceVideoChanges() async throws {
+        let track = Self.makeTrack(samples: [Self.makeSample(time: 0, pose: Self.makePose(with: [.leftWrist: (0.2, 0.5)]))])
+        let analyzer = StubPoseTrackAnalyzer(result: .success(track))
+        let viewModel = Self.makeSequenceViewModel(analyzer: analyzer)
+        let firstSourceURL = try Self.makeVideoFile(named: "first.mov", contents: "first")
+        let secondSourceURL = try Self.makeVideoFile(named: "second.mov", contents: "second")
+
+        await viewModel.importVideo { firstSourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysis()
+        await analyzer.complete()
+        await Task.yield()
+        #expect(viewModel.cleanedPoseTrack != nil)
+
+        await viewModel.importVideo { secondSourceURL }
+
+        #expect(viewModel.cleanedPoseTrack == nil)
     }
 
     private enum TestImportError: Error {
@@ -729,6 +1367,45 @@ struct ai_golfTests {
         }
     }
 
+    private actor DeferredFrameVideoProcessor: SwingVideoProcessing {
+        private var frameRequests: [(Double, CheckedContinuation<SwingExtractedFrame, Error>)] = []
+        private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+        func inspectVideo(at url: URL) async throws -> SwingVideoMetadata {
+            SwingVideoMetadata(durationSeconds: 10, width: 1920, height: 1080, nominalFrameRate: 30, hasUsableVideoTrack: true)
+        }
+
+        func extractFrame(at timestampSeconds: Double, from url: URL) async throws -> SwingExtractedFrame {
+            try await withCheckedThrowingContinuation { continuation in
+                frameRequests.append((timestampSeconds, continuation))
+                resumeReadyWaiters()
+            }
+        }
+
+        func waitForFrameExtractionCount(_ expectedCount: Int) async {
+            if frameRequests.count >= expectedCount { return }
+            await withCheckedContinuation { continuation in
+                countWaiters.append((expectedCount, continuation))
+            }
+        }
+
+        func completeFrameExtraction(at index: Int) async {
+            let timestampSeconds = frameRequests[index].0
+            do {
+                let frame = try ai_golfTests.makeFrame(requestedTimestampSeconds: timestampSeconds, actualTimestampSeconds: timestampSeconds)
+                frameRequests[index].1.resume(returning: frame)
+            } catch {
+                frameRequests[index].1.resume(throwing: error)
+            }
+        }
+
+        private func resumeReadyWaiters() {
+            let readyWaiters = countWaiters.filter { frameRequests.count >= $0.0 }
+            countWaiters.removeAll { frameRequests.count >= $0.0 }
+            readyWaiters.forEach { $0.1.resume() }
+        }
+    }
+
     private actor DeferredSourceURL {
         private var continuation: CheckedContinuation<URL, Error>?
         private var loadWaiter: CheckedContinuation<Void, Never>?
@@ -762,10 +1439,14 @@ struct ai_golfTests {
     }
 
     private static func makeVideoFile(named name: String, contents: String = "video") throws -> URL {
+        try makeVideoFile(named: name, bytes: Array(contents.utf8))
+    }
+
+    private static func makeVideoFile(named name: String, bytes: [UInt8]) throws -> URL {
         let directory = temporaryDirectory()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
         let url = directory.appending(path: name)
-        try Data(contents.utf8).write(to: url)
+        try Data(bytes).write(to: url)
         return url
     }
 
@@ -811,6 +1492,174 @@ struct ai_golfTests {
         )
     }
 
+    private static func makePose(
+        with points: [BodyJoint: (x: Double, y: Double)],
+        minimumConfidence: Double = 0.3
+    ) -> DetectedPose {
+        var posePoints = Dictionary(uniqueKeysWithValues: points.map { joint, point in
+            (joint, PosePoint(joint: joint, x: point.x, y: point.y, confidence: 0.9))
+        })
+        posePoints[.neck] = posePoints[.neck] ?? PosePoint(joint: .neck, x: 0.5, y: 0.25, confidence: 0.9)
+        posePoints[.root] = posePoints[.root] ?? PosePoint(joint: .root, x: 0.5, y: 0.55, confidence: 0.9)
+        posePoints[.leftShoulder] = posePoints[.leftShoulder] ?? PosePoint(joint: .leftShoulder, x: 0.35, y: 0.3, confidence: 0.9)
+        posePoints[.rightShoulder] = posePoints[.rightShoulder] ?? PosePoint(joint: .rightShoulder, x: 0.65, y: 0.3, confidence: 0.9)
+        posePoints[.leftHip] = posePoints[.leftHip] ?? PosePoint(joint: .leftHip, x: 0.4, y: 0.6, confidence: 0.9)
+        posePoints[.rightHip] = posePoints[.rightHip] ?? PosePoint(joint: .rightHip, x: 0.6, y: 0.6, confidence: 0.9)
+        return DetectedPose(points: posePoints, minimumConfidence: minimumConfidence)
+    }
+
+    private static func makeFullAnnotationPose(minimumConfidence: Double = 0.3) -> DetectedPose {
+        makePose(with: [
+            .leftElbow: (0.25, 0.45),
+            .rightElbow: (0.75, 0.45),
+            .leftWrist: (0.2, 0.55),
+            .rightWrist: (0.8, 0.55),
+            .leftKnee: (0.4, 0.8),
+            .rightKnee: (0.6, 0.8),
+            .leftAnkle: (0.4, 0.95),
+            .rightAnkle: (0.6, 0.95)
+        ], minimumConfidence: minimumConfidence)
+    }
+
+    @MainActor private static func makeCompletedAnnotationViewModel(
+        track: SwingPoseTrack,
+        datasetExporter: SwingAnnotationDatasetExporter = SwingAnnotationDatasetExporter()
+    ) async throws -> SwingImportViewModel {
+        let analyzer = StubPoseTrackAnalyzer(result: .success(track))
+        let viewModel = makeSequenceViewModel(analyzer: analyzer, datasetExporter: datasetExporter)
+        let sourceURL = try makeVideoFile(named: "source.mov")
+        await viewModel.importVideo { sourceURL }
+        viewModel.startPoseTrackAnalysis()
+        await analyzer.waitForAnalysis()
+        await analyzer.complete()
+        await Task.yield()
+        return viewModel
+    }
+
+    @MainActor private static func markAllPositions(in viewModel: SwingImportViewModel, track: SwingPoseTrack) async {
+        for (index, position) in SwingPosition.allCases.enumerated() {
+            await viewModel.selectPoseSample(at: index, in: track)
+            viewModel.markSelectedSample(as: position, in: track)
+        }
+    }
+
+    @MainActor private static func waitForPoseTrackCompletion(_ viewModel: SwingImportViewModel) async {
+        for _ in 0..<50 {
+            if case .completed = viewModel.poseTrackAnalysisState {
+                return
+            }
+            await Task.yield()
+        }
+    }
+
+    @MainActor private static func makeAnnotationMap(times: [SwingPosition: Double], includeInterpolatedWrist: Bool = false) -> [SwingPosition: SwingPositionAnnotation] {
+        Dictionary(uniqueKeysWithValues: times.map { position, time in
+            let cleanedSample = cleanedSample(
+                joints: [.neck, .root, .leftShoulder, .rightShoulder, .leftHip, .rightHip, .leftElbow, .leftWrist],
+                timestamp: time,
+                interpolatedJoints: includeInterpolatedWrist ? [.leftWrist] : []
+            )
+            return (position, SwingPositionAnnotation(
+                position: position,
+                sampleIndex: Int(time),
+                sampleID: UUID(),
+                requestedTimestamp: time,
+                actualTimestamp: time,
+                poseQualityCategory: .complete,
+                readiness: SwingAnnotationBuilder.readiness(for: cleanedSample),
+                availability: SwingAnnotationBuilder.availability(for: cleanedSample),
+                cleanedPoseSample: cleanedSample,
+                missingJoints: [],
+                note: nil
+            ))
+        })
+    }
+
+    @MainActor private static func makeAnnotationRecord(
+        identity: SwingAnnotationIdentity = SwingAnnotationIdentity(
+            annotationID: UUID(uuidString: "550E8400-E29B-41D4-A716-446655440000")!,
+            createdAt: Date(timeIntervalSince1970: 0)
+        ),
+        sourceVideoFilename: String = "swing-550E8400-E29B-41D4-A716-446655440000.mov",
+        context: SwingAnnotationContext = SwingAnnotationContext(),
+        analysisConfiguration: ExportedAnalysisConfiguration = ExportedAnalysisConfiguration(
+            intervalStartSeconds: 0,
+            intervalEndSeconds: 4,
+            requestedSamplingRate: 10,
+            analyzedSampleCount: 40,
+            confidenceThreshold: 0.3
+        ),
+        annotations: [SwingPosition: SwingPositionAnnotation]? = nil
+    ) throws -> SwingAnnotationRecord {
+        try SwingAnnotationBuilder.record(
+            identity: identity,
+            sourceVideoFilename: sourceVideoFilename,
+            context: context,
+            analysisConfiguration: analysisConfiguration,
+            annotations: annotations ?? makeAnnotationMap(times: [.address: 1, .top: 2, .impact: 3, .finish: 4])
+        )
+    }
+
+    private static func cleanedSample(
+        joints: [BodyJoint],
+        timestamp: Double = 0,
+        interpolatedJoints: Set<BodyJoint> = []
+    ) -> CleanedPoseSample {
+        let trackedJoints = Dictionary(uniqueKeysWithValues: joints.map { joint in
+            (joint, tracked(
+                x: joint == .leftWrist ? 0.2 : 0.5,
+                y: joint == .leftWrist ? 0.5 : 0.4,
+                source: interpolatedJoints.contains(joint) ? .interpolated : .observed
+            ))
+        })
+        return CleanedPoseSample(
+            id: UUID(),
+            timestamp: timestamp,
+            joints: trackedJoints,
+            landmarks: PoseTrackCleaner.deriveLandmarks(from: trackedJoints)
+        )
+    }
+
+    private static func makeJointSeries(_ xs: [Double?], includeBodyScale: Bool = false) -> [[BodyJoint: TrackedJointPoint]] {
+        xs.map { x in
+            var joints: [BodyJoint: TrackedJointPoint] = [:]
+            if let x {
+                joints[.leftWrist] = tracked(x: x, y: 0.5)
+            }
+            if includeBodyScale {
+                joints[.neck] = tracked(x: 0.5, y: 0.25)
+                joints[.root] = tracked(x: 0.5, y: 0.55)
+                joints[.leftShoulder] = tracked(x: 0.35, y: 0.3)
+                joints[.rightShoulder] = tracked(x: 0.65, y: 0.3)
+            }
+            return joints
+        }
+    }
+
+    private static func tracked(x: Double, y: Double, source: JointPointSource = .observed) -> TrackedJointPoint {
+        TrackedJointPoint(x: x, y: y, confidence: isObserved(source) ? 0.9 : nil, source: source)
+    }
+
+    private static func isObserved(_ source: JointPointSource) -> Bool {
+        return switch source {
+        case .observed: true
+        case .interpolated: false
+        }
+    }
+
+    private static func isObserved(_ point: TrackedJointPoint?) -> Bool {
+        guard let point else { return false }
+        return isObserved(point.source)
+    }
+
+    private static func isInterpolated(_ point: TrackedJointPoint?) -> Bool {
+        guard let point else { return false }
+        return switch point.source {
+        case .observed: false
+        case .interpolated: true
+        }
+    }
+
     private static func makeCompletePose(minimumConfidence: Double = 0.3) -> DetectedPose {
         DetectedPose(
             points: Dictionary(uniqueKeysWithValues: BodyJoint.allCases.map { joint in
@@ -834,12 +1683,16 @@ struct ai_golfTests {
         SwingPoseTrack(samples: samples, processingDurationSeconds: 1)
     }
 
-    @MainActor private static func makeSequenceViewModel(analyzer: SwingPoseTrackAnalyzing) -> SwingImportViewModel {
+    @MainActor private static func makeSequenceViewModel(
+        analyzer: SwingPoseTrackAnalyzing,
+        datasetExporter: SwingAnnotationDatasetExporter = SwingAnnotationDatasetExporter()
+    ) -> SwingImportViewModel {
         SwingImportViewModel(
             importDirectory: temporaryDirectory(),
             videoProcessor: StubVideoProcessor(metadata: SwingVideoMetadata(durationSeconds: 10, width: 1920, height: 1080, nominalFrameRate: 30, hasUsableVideoTrack: true)),
             poseEstimator: StubPoseEstimator(result: .success(makePose())),
-            poseTrackAnalyzer: analyzer
+            poseTrackAnalyzer: analyzer,
+            datasetExporter: datasetExporter
         )
     }
 }

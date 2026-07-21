@@ -1,10 +1,12 @@
 import AVKit
 import PhotosUI
 import SwiftUI
+import UIKit
 
 struct SwingImportView: View {
     @State private var viewModel = SwingImportViewModel()
     @State private var selectedItem: PhotosPickerItem?
+    @State private var reviewSampleIndex = 0.0
 
     private let pickerLoader = SwingVideoPickerLoader()
 
@@ -45,6 +47,21 @@ struct SwingImportView: View {
                     pickerLoader.removeTemporarySource(at: sourceURL)
                 }
             }
+            .sheet(isPresented: Binding(
+                get: {
+                    if case .readyToShare = viewModel.annotationExportState { return true }
+                    return false
+                },
+                set: { isPresented in
+                    if !isPresented {
+                        viewModel.dismissAnnotationExport()
+                    }
+                }
+            )) {
+                if case .readyToShare(let export) = viewModel.annotationExportState {
+                    ShareSheet(activityItems: export.shareItems)
+                }
+            }
         }
     }
 
@@ -73,17 +90,17 @@ struct SwingImportView: View {
 
         case .ready(let swing):
             VStack(alignment: .leading, spacing: 20) {
-                SwingVideoPlayer(url: swing.localVideoURL)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(.quaternary, lineWidth: 1)
-                    }
-
                 metadataContent
                 poseTrackAnalysisContent
-                frameExtractionControls
-                extractedFrameContent
+                DisclosureGroup("Video Preview") {
+                    videoPreview(url: swing.localVideoURL)
+                }
+                DisclosureGroup("Single Frame Tools") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        frameExtractionControls
+                        extractedFrameContent
+                    }
+                }
             }
 
         case .failed(let message):
@@ -103,6 +120,15 @@ struct SwingImportView: View {
         default:
             "Choose Swing Video"
         }
+    }
+
+    private func videoPreview(url: URL) -> some View {
+        SwingVideoPlayer(url: url)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(.quaternary, lineWidth: 1)
+            }
     }
 
     @ViewBuilder
@@ -338,8 +364,12 @@ struct SwingImportView: View {
             }
 
         case .completed(let track):
-            poseTrackSummary(track)
-            poseTrackSampleSelector(track)
+            DisclosureGroup("Analysis Details") {
+                poseTrackSummary(track)
+            }
+            cleanedTrackDiagnostics(track)
+            poseTrackSampleReview(track)
+            swingAnnotationContent(track)
 
         case .cancelled:
             Label("Sequence analysis cancelled.", systemImage: "stop.circle")
@@ -367,31 +397,141 @@ struct SwingImportView: View {
         .foregroundStyle(.secondary)
     }
 
-    private func poseTrackSampleSelector(_ track: SwingPoseTrack) -> some View {
+    private func cleanedTrackDiagnostics(_ track: SwingPoseTrack) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            if !track.samples.isEmpty {
-                Picker("Sample", selection: Binding(
-                    get: { viewModel.selectedPoseSampleID ?? track.samples[0].id },
-                    set: { sampleID in
-                        if let sample = track.samples.first(where: { $0.id == sampleID }) {
-                            Task { await viewModel.selectPoseSample(sample) }
+            Picker("Overlay", selection: Binding(
+                get: { viewModel.poseTrackOverlayMode },
+                set: { viewModel.poseTrackOverlayMode = $0 }
+            )) {
+                ForEach(SwingImportViewModel.PoseTrackOverlayMode.allCases, id: \.self) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Picker("Joint", selection: Binding(
+                get: { viewModel.selectedDiagnosticJoint },
+                set: { viewModel.selectedDiagnosticJoint = $0 }
+            )) {
+                ForEach(BodyJoint.allCases, id: \.self) { joint in
+                    Text(joint.displayName).tag(joint)
+                }
+            }
+            .pickerStyle(.menu)
+
+            DisclosureGroup("Coverage Details") {
+                if let cleanedTrack = viewModel.cleanedPoseTrack,
+                   let coverage = cleanedTrack.diagnostics.jointCoverage[viewModel.selectedDiagnosticJoint] {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(viewModel.selectedDiagnosticJoint.displayName): observed \(coverage.observedSampleCount), interpolated \(coverage.interpolatedSampleCount), unavailable \(coverage.unavailableSampleCount)")
+                        Text("Coverage: \(formatPercent(coverage.observedCoveragePercentage)) observed, \(formatPercent(coverage.effectiveCoveragePercentage)) effective")
+                        Text("Longest unavailable gap: \(coverage.longestUnavailableGap) samples, rejected outliers: \(coverage.rejectedOutlierCount)")
+                        Text("Total interpolated points: \(cleanedTrack.diagnostics.totalInterpolatedPointCount), rejected outliers: \(cleanedTrack.diagnostics.totalRejectedOutlierCount)")
+                        Text("Cleaning: \(formatSeconds(cleanedTrack.processingDurationSeconds))s")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                        ForEach(PoseTrackDiagnosticGroup.allCases, id: \.self) { group in
+                            if let groupCoverage = cleanedTrack.diagnostics.groupCoverage[group] {
+                                GridRow {
+                                    Text(group.displayName)
+                                    Text(formatPercent(groupCoverage.effectiveCoveragePercentage))
+                                        .monospacedDigit()
+                                }
+                            }
                         }
                     }
-                )) {
-                    ForEach(track.samples) { sample in
-                        Text("\(formatSeconds(sample.actualTime))s - \(sample.quality.category.rawValue)")
-                            .tag(sample.id)
-                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text("Cleaned diagnostics are generated after sequence analysis completes.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
-                .pickerStyle(.menu)
+            }
+        }
+    }
 
-                selectedPoseSampleContent
+    private func poseTrackSampleReview(_ track: SwingPoseTrack) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !track.samples.isEmpty {
+                let selectedIndex = viewModel.selectedPoseSampleIndex(in: track)
+
+                HStack(spacing: 12) {
+                    Button("Previous") {
+                        viewModel.requestAdjacentPoseSampleSelection(offset: -1, in: track)
+                    }
+                    .disabled(selectedIndex == 0)
+
+                    Spacer()
+
+                    Text("Sample \(selectedIndex + 1) of \(track.samples.count)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button("Next") {
+                        viewModel.requestAdjacentPoseSampleSelection(offset: 1, in: track)
+                    }
+                    .disabled(selectedIndex >= track.samples.count - 1)
+                }
+
+                sampleTimelineScrubber(track)
+                .onAppear {
+                    reviewSampleIndex = Double(selectedIndex)
+                }
+                .onChange(of: viewModel.selectedPoseSampleID) { _, _ in
+                    reviewSampleIndex = Double(viewModel.selectedPoseSampleIndex(in: track))
+                }
+
+                Text("Drag to choose a sample, then release to load its frame.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                selectedPoseSampleContent(track: track)
+            }
+        }
+    }
+
+    private func sampleTimelineScrubber(_ track: SwingPoseTrack) -> some View {
+        let previewIndex = min(max(Int(reviewSampleIndex.rounded()), 0), max(track.samples.count - 1, 0))
+        let previewSample = track.samples[previewIndex]
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Timeline")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("Sample \(previewIndex + 1) - \(formatSeconds(previewSample.actualTime))s")
+                    .font(.footnote)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            SampleTimelineScrubber(
+                samples: track.samples,
+                annotations: viewModel.annotations,
+                currentIndex: $reviewSampleIndex
+            ) { index in
+                viewModel.requestPoseSampleSelection(at: index, in: track)
+            }
+            .frame(height: 64)
+
+            HStack(spacing: 10) {
+                ForEach(SwingPosition.allCases, id: \.self) { position in
+                    Label(position.displayName, systemImage: "circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(annotationColor(position))
+                }
             }
         }
     }
 
     @ViewBuilder
-    private var selectedPoseSampleContent: some View {
+    private func selectedPoseSampleContent(track: SwingPoseTrack) -> some View {
         switch viewModel.selectedPoseSampleFrameState {
         case .idle:
             Text("Select a sample to review its frame and skeleton.")
@@ -406,22 +546,256 @@ struct SwingImportView: View {
             }
 
         case .loaded(let sample, let frame):
+            let cleanedSample = viewModel.selectedCleanedPoseSample(in: track)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Sample at \(formatSeconds(sample.actualTime))s")
+                Text("Frame at \(formatSeconds(sample.actualTime))s")
                     .font(.headline)
-                Text("Quality: \(sample.quality.category.rawValue)")
+                poseTrackFrameImage(frame, rawPose: sample.pose, cleanedSample: cleanedSample)
+                DisclosureGroup("Selected Sample Details") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Quality: \(sample.quality.category.rawValue)")
+                        Text("Missing: \(formatJoints(sample.quality.missingJoints))")
+                        selectedJointDetails(rawSample: sample, cleanedSample: cleanedSample)
+                    }
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                Text("Missing: \(formatJoints(sample.quality.missingJoints))")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                poseFrameImage(frame, pose: sample.pose)
+                }
             }
 
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
         }
+    }
+
+    private func selectedJointDetails(rawSample: PoseSample, cleanedSample: CleanedPoseSample?) -> some View {
+        let joint = viewModel.selectedDiagnosticJoint
+        let rawPoint = rawSample.pose?.points[joint]
+        let cleanedPoint = cleanedSample?.joints[joint]
+
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("Selected joint: \(joint.displayName)")
+            Text("Provenance: \(formatSource(cleanedPoint?.source))")
+            Text("Raw: \(formatRawPoint(rawPoint, minimumConfidence: rawSample.pose?.minimumConfidence))")
+            Text("Cleaned: \(formatTrackedPoint(cleanedPoint))")
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+    }
+
+    private func swingAnnotationContent(_ track: SwingPoseTrack) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Manual Swing Annotation")
+                .font(.headline)
+
+            annotationContextControls
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Current sample: \(viewModel.selectedPoseSampleIndex(in: track) + 1) of \(track.samples.count)")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                ForEach(SwingPosition.allCases, id: \.self) { position in
+                    annotationRow(position, track: track)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Mark Current Sample")
+                    .font(.subheadline)
+                Grid(horizontalSpacing: 8, verticalSpacing: 8) {
+                    GridRow {
+                        annotationMarkButton(.address, track: track)
+                        annotationMarkButton(.top, track: track)
+                    }
+                    GridRow {
+                        annotationMarkButton(.impact, track: track)
+                        annotationMarkButton(.finish, track: track)
+                    }
+                }
+            }
+
+            let validation = viewModel.annotationValidation
+            Text(validation.message)
+                .font(.footnote)
+                .foregroundStyle(validation.canExport ? Color.secondary : Color.orange)
+
+            if let message = viewModel.annotationMessage {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(annotationMessageColor)
+            }
+
+            if viewModel.annotationExportState == .preparingFiles {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Preparing matched video and JSON files...")
+                        .font(.footnote)
+                }
+            }
+
+            Button {
+                Task {
+                    await viewModel.exportAnnotation()
+                }
+            } label: {
+                Label("Export Dataset Pair", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!validation.canExport || viewModel.annotationExportState == .preparingFiles)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var annotationContextControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Handedness", selection: Binding(
+                get: { viewModel.annotationContext.golferHandedness },
+                set: { viewModel.annotationContext.golferHandedness = $0 }
+            )) {
+                ForEach(GolferHandedness.allCases, id: \.self) { handedness in
+                    Text(handedness.displayName).tag(handedness)
+                }
+            }
+
+            Picker("Camera", selection: Binding(
+                get: { viewModel.annotationContext.cameraView },
+                set: { viewModel.annotationContext.cameraView = $0 }
+            )) {
+                ForEach(CameraView.allCases, id: \.self) { view in
+                    Text(view.displayName).tag(view)
+                }
+            }
+
+            Picker("Club", selection: Binding(
+                get: { viewModel.annotationContext.golfClub },
+                set: { viewModel.annotationContext.golfClub = $0 }
+            )) {
+                ForEach(GolfClub.allCases, id: \.self) { club in
+                    Text(club.displayName).tag(club)
+                }
+            }
+
+            TextField("Golfer nickname", text: Binding(
+                get: { viewModel.annotationContext.golferIdentifier },
+                set: { viewModel.annotationContext.golferIdentifier = $0 }
+            ))
+            .textFieldStyle(.roundedBorder)
+
+            Picker("Annotator role", selection: Binding(
+                get: { viewModel.annotationContext.annotatorRole },
+                set: { viewModel.annotationContext.annotatorRole = $0 }
+            )) {
+                ForEach(AnnotatorRole.allCases, id: \.self) { role in
+                    Text(role.displayName).tag(role)
+                }
+            }
+
+            TextField("Annotator identifier", text: Binding(
+                get: { viewModel.annotationContext.annotatorIdentifier ?? "" },
+                set: { value in
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    viewModel.annotationContext.annotatorIdentifier = trimmed.isEmpty ? nil : value
+                }
+            ))
+            .textFieldStyle(.roundedBorder)
+
+            TextField("Coach notes", text: Binding(
+                get: { viewModel.annotationContext.coachNotes },
+                set: { viewModel.annotationContext.coachNotes = $0 }
+            ), axis: .vertical)
+            .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    private func annotationRow(_ position: SwingPosition, track: SwingPoseTrack) -> some View {
+        let annotation = viewModel.annotation(for: position)
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(position.displayName)
+                        .font(.subheadline.weight(.semibold))
+                    Text(position.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(annotation.map { "\(formatSeconds($0.actualTimestamp))s - \($0.readiness.displayName)" } ?? "Not marked")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Jump") {
+                    viewModel.jumpToAnnotation(position, in: track)
+                }
+                .disabled(annotation == nil)
+                Button("Clear") {
+                    viewModel.clearAnnotation(position)
+                }
+                .disabled(annotation == nil)
+            }
+
+            if let annotation {
+                TextField("\(position.displayName) note", text: Binding(
+                    get: { annotation.note ?? "" },
+                    set: { viewModel.updateAnnotationNote($0, for: position) }
+                ), axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+
+                DisclosureGroup("Pose Readiness Details") {
+                    Text(annotationAvailabilitySummary(annotation.availability))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func annotationMarkButton(_ position: SwingPosition, track: SwingPoseTrack) -> some View {
+        Button("Mark as \(position.displayName)") {
+            viewModel.markSelectedSample(as: position, in: track)
+        }
+        .buttonStyle(.bordered)
+    }
+
+    private func annotationAvailabilitySummary(_ availability: PositionLandmarkAvailability) -> String {
+        "Shoulders midpoint: \(formatBool(availability.shoulderMidpoint)), hips midpoint: \(formatBool(availability.hipMidpoint)), torso axis: \(formatBool(availability.torsoAxis)), one wrist: \(formatBool(availability.atLeastOneWrist)), both wrists: \(formatBool(availability.bothWrists)), wrist midpoint: \(formatBool(availability.wristMidpoint))"
+    }
+
+    private var annotationMessageColor: Color {
+        if case .failed = viewModel.annotationExportState {
+            return .red
+        }
+        return .secondary
+    }
+
+    private func poseTrackFrameImage(_ frame: SwingExtractedFrame, rawPose: DetectedPose?, cleanedSample: CleanedPoseSample?) -> some View {
+        let imageSize = CGSize(width: frame.image.width, height: frame.image.height)
+
+        return Image(decorative: frame.image, scale: 1)
+            .resizable()
+            .scaledToFit()
+            .overlay {
+                if viewModel.isPoseOverlayVisible {
+                    switch viewModel.poseTrackOverlayMode {
+                    case .raw:
+                        if let rawPose {
+                            PoseSkeletonOverlay(pose: rawPose, imageSize: imageSize)
+                        }
+                    case .cleaned:
+                        if let cleanedSample {
+                            CleanedPoseSkeletonOverlay(sample: cleanedSample, imageSize: imageSize)
+                        }
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay {
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(.quaternary, lineWidth: 1)
+            }
     }
 
     @ViewBuilder
@@ -536,8 +910,150 @@ struct SwingImportView: View {
         value.formatted(.number.precision(.fractionLength(1)))
     }
 
+    private func formatPercent(_ value: Double) -> String {
+        "\(value.formatted(.number.precision(.fractionLength(0...1))))%"
+    }
+
     private func formatJoints(_ joints: [BodyJoint]) -> String {
         joints.isEmpty ? "None" : joints.map(\.displayName).joined(separator: ", ")
+    }
+
+    private func formatSource(_ source: JointPointSource?) -> String {
+        switch source {
+        case .observed: "observed"
+        case .interpolated: "interpolated"
+        case nil: "unavailable"
+        }
+    }
+
+    private func formatRawPoint(_ point: PosePoint?, minimumConfidence: Double?) -> String {
+        guard let point, let minimumConfidence, point.confidence >= minimumConfidence else { return "unavailable" }
+        return "x \(formatCoordinate(point.x)), y \(formatCoordinate(point.y)), conf \(formatConfidence(point.confidence))"
+    }
+
+    private func formatTrackedPoint(_ point: TrackedJointPoint?) -> String {
+        guard let point else { return "unavailable" }
+        let confidence = point.confidence.map { ", conf \(formatConfidence($0))" } ?? ""
+        return "x \(formatCoordinate(point.x)), y \(formatCoordinate(point.y))\(confidence)"
+    }
+
+    private func formatCoordinate(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(3)))
+    }
+
+    private func formatBool(_ value: Bool) -> String {
+        value ? "yes" : "no"
+    }
+
+    private func annotationColor(_ position: SwingPosition) -> Color {
+        switch position {
+        case .address: .green
+        case .top: .blue
+        case .impact: .orange
+        case .finish: .purple
+        }
+    }
+}
+
+private struct SampleTimelineScrubber: View {
+    let samples: [PoseSample]
+    let annotations: [SwingPosition: SwingPositionAnnotation]
+    @Binding var currentIndex: Double
+    let onCommit: (Int) -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(proxy.size.width, 1)
+            let maxIndex = max(samples.count - 1, 0)
+            let selectedIndex = min(max(Int(currentIndex.rounded()), 0), maxIndex)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(.secondary.opacity(0.18))
+                    .frame(height: 12)
+                    .position(x: width / 2, y: 32)
+
+                Capsule()
+                    .fill(.blue.opacity(0.35))
+                    .frame(width: xPosition(for: selectedIndex, width: width) + 6, height: 12)
+                    .position(x: (xPosition(for: selectedIndex, width: width) + 6) / 2, y: 32)
+
+                ForEach(tickIndices, id: \.self) { index in
+                    Rectangle()
+                        .fill(.secondary.opacity(0.35))
+                        .frame(width: 1, height: index == selectedIndex ? 24 : 14)
+                        .position(x: xPosition(for: index, width: width), y: 32)
+                }
+
+                ForEach(SwingPosition.allCases, id: \.self) { position in
+                    if let annotation = annotations[position] {
+                        VStack(spacing: 2) {
+                            Circle()
+                                .fill(color(for: position))
+                                .frame(width: 10, height: 10)
+                            Rectangle()
+                                .fill(color(for: position))
+                                .frame(width: 3, height: 28)
+                        }
+                        .position(x: xPosition(for: annotation.sampleIndex, width: width), y: 22)
+                    }
+                }
+
+                Circle()
+                    .fill(.white)
+                    .frame(width: 28, height: 28)
+                    .shadow(radius: 2)
+                    .overlay {
+                        Circle().stroke(.blue, lineWidth: 3)
+                    }
+                    .position(x: xPosition(for: selectedIndex, width: width), y: 32)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        currentIndex = Double(index(for: value.location.x, width: width))
+                    }
+                    .onEnded { value in
+                        let index = index(for: value.location.x, width: width)
+                        currentIndex = Double(index)
+                        onCommit(index)
+                    }
+            )
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Sample timeline")
+        .accessibilityValue("Sample \(Int(currentIndex.rounded()) + 1) of \(samples.count)")
+    }
+
+    private var tickIndices: [Int] {
+        guard samples.count > 1 else { return [0] }
+        let step = max(samples.count / 32, 1)
+        var indices = Array(stride(from: 0, through: samples.count - 1, by: step))
+        if indices.last != samples.count - 1 {
+            indices.append(samples.count - 1)
+        }
+        return indices
+    }
+
+    private func xPosition(for index: Int, width: Double) -> Double {
+        guard samples.count > 1 else { return width / 2 }
+        return Double(min(max(index, 0), samples.count - 1)) / Double(samples.count - 1) * width
+    }
+
+    private func index(for xPosition: Double, width: Double) -> Int {
+        guard samples.count > 1 else { return 0 }
+        let fraction = min(max(xPosition / width, 0), 1)
+        return Int((fraction * Double(samples.count - 1)).rounded())
+    }
+
+    private func color(for position: SwingPosition) -> Color {
+        switch position {
+        case .address: .green
+        case .top: .blue
+        case .impact: .orange
+        case .finish: .purple
+        }
     }
 }
 
@@ -573,6 +1089,62 @@ private struct PoseSkeletonOverlay: View {
         }
         .allowsHitTesting(false)
     }
+}
+
+private struct CleanedPoseSkeletonOverlay: View {
+    let sample: CleanedPoseSample
+    let imageSize: CGSize
+
+    var body: some View {
+        GeometryReader { proxy in
+            let transform = PoseOverlayTransform(imageSize: imageSize, viewSize: proxy.size)
+            let connections = SwingPoseSkeleton.connections.filter { connection in
+                sample.joints[connection.start] != nil && sample.joints[connection.end] != nil
+            }
+
+            Canvas { context, _ in
+                for connection in connections {
+                    guard let start = sample.joints[connection.start],
+                          let end = sample.joints[connection.end] else {
+                        continue
+                    }
+
+                    var path = Path()
+                    path.move(to: transform.viewPoint(for: start.posePoint(joint: connection.start)))
+                    path.addLine(to: transform.viewPoint(for: end.posePoint(joint: connection.end)))
+                    let color: Color = start.source == .interpolated || end.source == .interpolated ? .cyan.opacity(0.75) : .yellow
+                    context.stroke(path, with: .color(color), lineWidth: 3)
+                }
+
+                for (joint, point) in sample.joints {
+                    let center = transform.viewPoint(for: point.posePoint(joint: joint))
+                    let rect = CGRect(x: center.x - 4, y: center.y - 4, width: 8, height: 8)
+                    if point.source == .interpolated {
+                        context.stroke(Path(ellipseIn: rect.insetBy(dx: -2, dy: -2)), with: .color(.cyan), lineWidth: 2)
+                    } else {
+                        context.fill(Path(ellipseIn: rect), with: .color(.red))
+                    }
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private extension TrackedJointPoint {
+    func posePoint(joint: BodyJoint) -> PosePoint {
+        PosePoint(joint: joint, x: x, y: y, confidence: confidence ?? 1)
+    }
+}
+
+private struct ShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 #Preview {
